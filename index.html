@@ -178,7 +178,7 @@ window.__SUPABASE_ANON_KEY__ = 'sb_publishable_3fl5Z9i3NAfwlWHDG2s21g_wZzsFvwn';
 /* Data lives in Supabase (Postgres) behind Row Level Security. Only staff
    accounts you create in Supabase Auth can sign in and see/change anything. */
 
-const supabase = (window.supabase && typeof window.supabase.createClient === 'function')
+const supabaseClient = (window.supabase && typeof window.supabase.createClient === 'function')
   ? window.supabase.createClient(window.__SUPABASE_URL__, window.__SUPABASE_ANON_KEY__)
   : null;
 let CURRENT_USER = null; // { id, email }
@@ -253,11 +253,11 @@ function mapCompanyToDb(c) {
 /* ---------- Load everything after sign-in ---------- */
 async function loadAll() {
   const [custRes, itemRes, docRes, counterRes, companyRes] = await Promise.all([
-    supabase.from('customers').select('*').order('name'),
-    supabase.from('items').select('*').order('description'),
-    supabase.from('documents').select('*').order('created_at', { ascending: false }),
-    supabase.from('counters').select('*').eq('id', 1).single(),
-    supabase.from('company_settings').select('*').eq('id', 1).single(),
+    supabaseClient.from('customers').select('*').order('name'),
+    supabaseClient.from('items').select('*').order('description'),
+    supabaseClient.from('documents').select('*').order('created_at', { ascending: false }),
+    supabaseClient.from('counters').select('*').eq('id', 1).single(),
+    supabaseClient.from('company_settings').select('*').eq('id', 1).single(),
   ]);
   const firstError = custRes.error || itemRes.error || docRes.error || counterRes.error || companyRes.error;
   if (firstError) {
@@ -285,21 +285,21 @@ function showLoadError(msg) {
 
 /* ---------- Shared create/update/delete helpers ---------- */
 async function createCustomerRecord(fields) {
-  const { data: numData, error: numErr } = await supabase.rpc('next_customer_number');
+  const { data: numData, error: numErr } = await supabaseClient.rpc('next_customer_number');
   if (numErr) { alert('Could not assign a customer number — ' + numErr.message); return null; }
   const cust = { num: String(numData), chargeVat: true, disabled: false, isNew: true, exportedToQBO: false, ...fields };
-  const { error: insErr } = await supabase.from('customers').insert(mapCustomerToDb(cust));
+  const { error: insErr } = await supabaseClient.from('customers').insert(mapCustomerToDb(cust));
   if (insErr) { alert('Could not save this customer — ' + insErr.message); return null; }
   STATE.customers.push(cust);
   STATE.counters.customerNum = numData;
   return cust;
 }
 async function createItemRecord(fields) {
-  const { data: numData, error: numErr } = await supabase.rpc('next_item_code');
+  const { data: numData, error: numErr } = await supabaseClient.rpc('next_item_code');
   if (numErr) { alert('Could not assign an item code — ' + numErr.message); return null; }
   const code = `ITM-${String(numData).padStart(4, '0')}`;
   const item = { code, isNew: true, ...fields };
-  const { error: insErr } = await supabase.from('items').insert(mapItemToDb(item));
+  const { error: insErr } = await supabaseClient.from('items').insert(mapItemToDb(item));
   if (insErr) { alert('Could not save this item — ' + insErr.message); return null; }
   STATE.items.push(item);
   STATE.counters.itemCode = numData;
@@ -433,13 +433,13 @@ function wireDashboardRowActions(tbody) {
       if (btn.dataset.act === 'convert') { await convertQuoteToInvoice(doc); }
       if (btn.dataset.act === 'paid') {
         doc.status = 'Paid'; doc.updatedAt = new Date().toISOString();
-        const { error } = await supabase.from('documents').update({ status: 'Paid', updated_at: doc.updatedAt }).eq('id', id);
+        const { error } = await supabaseClient.from('documents').update({ status: 'Paid', updated_at: doc.updatedAt }).eq('id', id);
         if (error) { alert('Could not update — ' + error.message); return; }
         refreshDashboardBody();
       }
       if (btn.dataset.act === 'delete') {
         if (confirm(`Delete ${doc.number}? This cannot be undone.`)) {
-          const { error } = await supabase.from('documents').delete().eq('id', id);
+          const { error } = await supabaseClient.from('documents').delete().eq('id', id);
           if (error) { alert('Could not delete — ' + error.message); return; }
           STATE.documents = STATE.documents.filter(x => x.id !== id);
           refreshDashboardBody();
@@ -491,7 +491,7 @@ function loadDocIntoBuilder(doc) {
 }
 
 async function convertQuoteToInvoice(quote) {
-  const { data: numData, error: numErr } = await supabase.rpc('next_invoice_number');
+  const { data: numData, error: numErr } = await supabaseClient.rpc('next_invoice_number');
   if (numErr) { alert(`Could not assign an invoice number — ${numErr.message}`); return; }
   const inv = JSON.parse(JSON.stringify(quote));
   delete inv.id;
@@ -503,14 +503,14 @@ async function convertQuoteToInvoice(quote) {
   inv.quoteRef = quote.number;
   inv.exportedToQBO = false;
 
-  const { data: insData, error: insErr } = await supabase.from('documents').insert(mapDocToDb(inv)).select().single();
+  const { data: insData, error: insErr } = await supabaseClient.from('documents').insert(mapDocToDb(inv)).select().single();
   if (insErr) { alert(`Could not create the invoice — ${insErr.message}`); return; }
   inv.id = insData.id;
   inv.createdAt = insData.created_at;
   inv.updatedAt = insData.updated_at;
   STATE.counters.invoiceNum = numData;
 
-  const { error: updErr } = await supabase.from('documents').update({ status: 'Converted' }).eq('id', quote.id);
+  const { error: updErr } = await supabaseClient.from('documents').update({ status: 'Converted' }).eq('id', quote.id);
   if (updErr) { alert(`Invoice was created, but could not mark the quote as converted — ${updErr.message}`); }
   else { quote.status = 'Converted'; quote.updatedAt = new Date().toISOString(); }
 
@@ -589,7 +589,7 @@ function renderCustomerSummary(c, customerNum) {
       return;
     }
     if (!confirm(`Delete ${cust.name}? This cannot be undone.`)) return;
-    const { error } = await supabase.from('customers').delete().eq('num', customerNum);
+    const { error } = await supabaseClient.from('customers').delete().eq('num', customerNum);
     if (error) {
       alert('Could not delete this customer — ' + error.message);
       return;
@@ -626,13 +626,13 @@ function renderCustomerSummary(c, customerNum) {
       if (btn.dataset.act === 'convert') { await convertQuoteToInvoice(doc); }
       if (btn.dataset.act === 'paid') {
         doc.status = 'Paid'; doc.updatedAt = new Date().toISOString();
-        const { error } = await supabase.from('documents').update({ status: 'Paid', updated_at: doc.updatedAt }).eq('id', id);
+        const { error } = await supabaseClient.from('documents').update({ status: 'Paid', updated_at: doc.updatedAt }).eq('id', id);
         if (error) { alert('Could not update — ' + error.message); return; }
         renderCustomerSummary(c, customerNum);
       }
       if (btn.dataset.act === 'delete') {
         if (confirm(`Delete ${doc.number}? This cannot be undone.`)) {
-          const { error } = await supabase.from('documents').delete().eq('id', id);
+          const { error } = await supabaseClient.from('documents').delete().eq('id', id);
           if (error) { alert('Could not delete — ' + error.message); return; }
           STATE.documents = STATE.documents.filter(x => x.id !== id);
           renderCustomerSummary(c, customerNum);
@@ -952,13 +952,13 @@ async function saveDocument(type, preview) {
   if (isNewDoc) {
     if (!d.number) {
       const rpcName = type === 'quote' ? 'next_quote_number' : 'next_invoice_number';
-      const { data: numData, error: numErr } = await supabase.rpc(rpcName);
+      const { data: numData, error: numErr } = await supabaseClient.rpc(rpcName);
       if (numErr) { alert(`Could not assign a number — ${numErr.message}`); return; }
       d.number = String(numData);
       STATE.counters[type === 'quote' ? 'quoteNum' : 'invoiceNum'] = numData;
     }
     d.status = d.status || 'Draft';
-    const { data: insData, error: insErr } = await supabase.from('documents').insert(mapDocToDb(d)).select().single();
+    const { data: insData, error: insErr } = await supabaseClient.from('documents').insert(mapDocToDb(d)).select().single();
     if (insErr) { alert(`Could not save this ${type} — ${insErr.message}`); return; }
     d.id = insData.id;
     d.createdAt = insData.created_at;
@@ -966,7 +966,7 @@ async function saveDocument(type, preview) {
     STATE.documents.unshift(d);
   } else {
     d.updatedAt = new Date().toISOString();
-    const { error: updErr } = await supabase.from('documents').update(mapDocToDb(d)).eq('id', d.id);
+    const { error: updErr } = await supabaseClient.from('documents').update(mapDocToDb(d)).eq('id', d.id);
     if (updErr) { alert(`Could not save this ${type} — ${updErr.message}`); return; }
     STATE.documents[existingIdx] = d;
   }
@@ -1318,8 +1318,8 @@ function renderSettings(c) {
     const newInvoiceNum = Number(document.getElementById('nextInvoiceNum').value) || STATE.counters.invoiceNum;
     const newCustNum = Number(document.getElementById('nextCustNum').value) || STATE.counters.customerNum;
 
-    const { error: coErr } = await supabase.from('company_settings').update(mapCompanyToDb(STATE.company)).eq('id', 1);
-    const { error: counterErr } = await supabase.from('counters')
+    const { error: coErr } = await supabaseClient.from('company_settings').update(mapCompanyToDb(STATE.company)).eq('id', 1);
+    const { error: counterErr } = await supabaseClient.from('counters')
       .update({ quote_num: newQuoteNum, invoice_num: newInvoiceNum, customer_num: newCustNum }).eq('id', 1);
     if (coErr || counterErr) {
       alert('Could not save settings — ' + (coErr || counterErr).message);
@@ -1378,7 +1378,7 @@ function renderExport(c) {
     const rows = [header, ...newCustomers.map(x => [x.num, x.name, '', x.terms, x.reg, x.chargeVat ? 'TRUE':'FALSE', x.vat, '', x.contact, x.email, x.phone, '', x.address, x.city, x.postCode, '', 'South Africa', 'ZA', '', '', '', x.disabled ? 'TRUE':'FALSE'])];
     downloadCSV(`hakuna_new_customers_${todayISO()}.csv`, rows);
     const nums = newCustomers.map(x => x.num);
-    const { error } = await supabase.from('customers').update({ exported_to_qbo: true }).in('num', nums);
+    const { error } = await supabaseClient.from('customers').update({ exported_to_qbo: true }).in('num', nums);
     if (error) { alert('CSV downloaded, but could not mark customers as exported — ' + error.message); return; }
     newCustomers.forEach(x => x.exportedToQBO = true);
     renderExport(c);
@@ -1418,7 +1418,7 @@ function renderExport(c) {
     });
     downloadCSV(`hakuna_invoices_${todayISO()}.csv`, rows);
     const ids = unexportedInvoices.map(x => x.id);
-    const { error } = await supabase.from('documents').update({ exported_to_qbo: true }).in('id', ids);
+    const { error } = await supabaseClient.from('documents').update({ exported_to_qbo: true }).in('id', ids);
     if (error) { alert('CSV downloaded, but could not mark invoices as exported — ' + error.message); return; }
     unexportedInvoices.forEach(x => x.exportedToQBO = true);
     renderExport(c);
@@ -1464,7 +1464,7 @@ async function handleLogin() {
   if (!email || !password) { showLoginScreen('Enter both email and password.'); return; }
   const loginBtn = document.getElementById('loginBtn');
   loginBtn.disabled = true; loginBtn.textContent = 'Signing in…';
-  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  const { data, error } = await supabaseClient.auth.signInWithPassword({ email, password });
   loginBtn.disabled = false; loginBtn.textContent = 'Sign In';
   if (error) { showLoginScreen(error.message); return; }
   CURRENT_USER = { id: data.user.id, email: data.user.email };
@@ -1472,14 +1472,14 @@ async function handleLogin() {
 }
 
 async function handleLogout() {
-  await supabase.auth.signOut();
+  await supabaseClient.auth.signOut();
   CURRENT_USER = null;
   STATE.loaded = false;
   showLoginScreen();
 }
 
 (async function boot() {
-  if (!supabase) {
+  if (!supabaseClient) {
     document.getElementById('loginScreen').innerHTML = `
       <div class="login-box">
         <h1>Couldn't load required library</h1>
@@ -1491,8 +1491,8 @@ async function handleLogout() {
       </div>`;
     return;
   }
-  if (!window.__SUPABASE_URL__ || window.__SUPABASE_URL__ === 'https://yrkgbfixzbztbbblxfxw.supabase.co' ||
-      !window.__SUPABASE_ANON_KEY__ || window.__SUPABASE_ANON_KEY__ === 'sb_publishable_3fl5Z9i3NAfwlWHDG2s21g_wZzsFvwn') {
+  if (!window.__SUPABASE_URL__ || window.__SUPABASE_URL__ === 'YOUR_SUPABASE_PROJECT_URL' ||
+      !window.__SUPABASE_ANON_KEY__ || window.__SUPABASE_ANON_KEY__ === 'YOUR_SUPABASE_ANON_KEY') {
     showConfigMissingScreen();
     return;
   }
@@ -1501,7 +1501,7 @@ async function handleLogout() {
   document.getElementById('loginPassword').addEventListener('keydown', (e) => { if (e.key === 'Enter') handleLogin(); });
   document.getElementById('logoutBtn').onclick = handleLogout;
 
-  const { data: { session } } = await supabase.auth.getSession();
+  const { data: { session } } = await supabaseClient.auth.getSession();
   if (session && session.user) {
     CURRENT_USER = { id: session.user.id, email: session.user.email };
     await showApp();
