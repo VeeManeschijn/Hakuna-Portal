@@ -196,6 +196,7 @@ const DEFAULT_COMPANY = {
   absaBranch: '632 005',
   fnbAcc: '628 183 530 89',
   fnbBranch: '250 655',
+  reorderThreshold: 5,
 };
 
 /* ---------- DB row <-> app object mapping ---------- */
@@ -210,10 +211,12 @@ function mapCustomerToDb(c) {
     disabled: !!c.disabled, is_new: !!c.isNew, exported_to_qbo: !!c.exportedToQBO };
 }
 function mapItemFromDb(r) {
-  return { code: r.code, desc: r.description, price: Number(r.price) || 0, vat: r.vat, isNew: r.is_new };
+  return { code: r.code, desc: r.description, price: Number(r.price) || 0, vat: r.vat, isNew: r.is_new,
+    stockQty: (r.stock_qty === null || r.stock_qty === undefined) ? null : Number(r.stock_qty) };
 }
 function mapItemToDb(it) {
-  return { code: it.code, description: it.desc, price: Number(it.price) || 0, vat: it.vat, is_new: !!it.isNew };
+  return { code: it.code, description: it.desc, price: Number(it.price) || 0, vat: it.vat, is_new: !!it.isNew,
+    stock_qty: (it.stockQty === null || it.stockQty === undefined || it.stockQty === '') ? null : Number(it.stockQty) };
 }
 function mapDocFromDb(r) {
   return { id: r.id, type: r.type, number: r.number, status: r.status, customer: r.customer_snapshot,
@@ -221,7 +224,7 @@ function mapDocFromDb(r) {
     poNumber: r.po_number || '', jobcard: r.jobcard || '', tec: r.tec || '', hkm: r.hkm || '', quoteRef: r.quote_ref || '',
     issueDate: r.issue_date || '', dueDate: r.due_date || '', items: r.items || [],
     subtotal: Number(r.subtotal) || 0, taxTotal: Number(r.tax_total) || 0, total: Number(r.total) || 0,
-    exportedToQBO: r.exported_to_qbo, createdAt: r.created_at, updatedAt: r.updated_at };
+    exportedToQBO: r.exported_to_qbo, stockDeducted: !!r.stock_deducted, createdAt: r.created_at, updatedAt: r.updated_at };
 }
 function mapDocToDb(d) {
   return { type: d.type, number: d.number, status: d.status, customer_num: d.customer.num, customer_snapshot: d.customer,
@@ -229,16 +232,19 @@ function mapDocToDb(d) {
     jobcard: d.jobcard, tec: d.tec, hkm: d.hkm, quote_ref: d.quoteRef,
     issue_date: d.issueDate || null, due_date: d.dueDate || null,
     items: d.items, subtotal: d.subtotal, tax_total: d.taxTotal, total: d.total,
-    exported_to_qbo: !!d.exportedToQBO, created_by: CURRENT_USER ? CURRENT_USER.id : null,
+    exported_to_qbo: !!d.exportedToQBO, stock_deducted: !!d.stockDeducted,
+    created_by: CURRENT_USER ? CURRENT_USER.id : null,
     created_by_email: CURRENT_USER ? CURRENT_USER.email : null };
 }
 function mapCompanyFromDb(r) {
   return { name: r.name, address: r.address, city: r.city, phone: r.phone, email: r.email, vat: r.vat, reg: r.reg,
-    merchantNo: r.merchant_no, absaAcc: r.absa_acc, absaBranch: r.absa_branch, fnbAcc: r.fnb_acc, fnbBranch: r.fnb_branch };
+    merchantNo: r.merchant_no, absaAcc: r.absa_acc, absaBranch: r.absa_branch, fnbAcc: r.fnb_acc, fnbBranch: r.fnb_branch,
+    reorderThreshold: (r.reorder_threshold === null || r.reorder_threshold === undefined) ? 5 : Number(r.reorder_threshold) };
 }
 function mapCompanyToDb(c) {
   return { name: c.name, address: c.address, city: c.city, phone: c.phone, email: c.email, vat: c.vat, reg: c.reg,
-    merchant_no: c.merchantNo, absa_acc: c.absaAcc, absa_branch: c.absaBranch, fnb_acc: c.fnbAcc, fnb_branch: c.fnbBranch };
+    merchant_no: c.merchantNo, absa_acc: c.absaAcc, absa_branch: c.absaBranch, fnb_acc: c.fnbAcc, fnb_branch: c.fnbBranch,
+    reorder_threshold: Number(c.reorderThreshold) || 5 };
 }
 
 /* ---------- Load everything after sign-in ---------- */
@@ -289,12 +295,35 @@ async function createItemRecord(fields) {
   const { data: numData, error: numErr } = await supabaseClient.rpc('next_item_code');
   if (numErr) { alert('Could not assign an item code — ' + numErr.message); return null; }
   const code = `ITM-${String(numData).padStart(4, '0')}`;
-  const item = { code, isNew: true, ...fields };
+  const item = { code, isNew: true, stockQty: null, ...fields };
   const { error: insErr } = await supabaseClient.from('items').insert(mapItemToDb(item));
   if (insErr) { alert('Could not save this item — ' + insErr.message); return null; }
+  if (item.stockQty !== null) {
+    await supabaseClient.from('stock_movements').insert({
+      item_code: code, movement_type: 'initial_count', qty_change: item.stockQty, qty_before: 0, qty_after: item.stockQty,
+      created_by: CURRENT_USER ? CURRENT_USER.id : null, created_by_email: CURRENT_USER ? CURRENT_USER.email : null,
+    });
+  }
   STATE.items.push(item);
   STATE.counters.itemCode = numData;
   return item;
+}
+
+// Deducts (sign=-1) or restores (sign=+1) stock for every line item on an
+// invoice that matches a catalog item. Custom/free-text line items (no
+// matching code in STATE.items) are silently skipped — nothing to track.
+async function adjustStockForInvoice(invoiceDoc, sign) {
+  const movementType = sign < 0 ? 'invoice_deduct' : 'invoice_restore';
+  for (const line of invoiceDoc.items) {
+    const catalogItem = STATE.items.find(x => x.code === line.code);
+    if (!catalogItem || catalogItem.stockQty === null) continue;
+    const delta = sign * (Number(line.qty) || 0);
+    if (!delta) continue;
+    const { data: newQty, error } = await supabaseClient.rpc('record_stock_movement', {
+      p_code: line.code, p_delta: delta, p_type: movementType, p_reference: invoiceDoc.number, p_notes: null,
+    });
+    if (!error && newQty !== null) catalogItem.stockQty = Number(newQty);
+  }
 }
 
 function fmtMoney(n) {
@@ -328,6 +357,8 @@ const TABS = [
   { id: 'newinvoice', label: '+ New Invoice' },
   { id: 'customers', label: 'Customers' },
   { id: 'items', label: 'Items' },
+  { id: 'receipts', label: 'Stock Receipts' },
+  { id: 'assets', label: 'Assets' },
   { id: 'settings', label: 'Settings' },
   { id: 'export', label: 'Export to QuickBooks' },
 ];
@@ -365,6 +396,8 @@ function renderContent() {
     case 'newinvoice': return renderDocBuilder(c, 'invoice');
     case 'customers': return renderCustomers(c);
     case 'items': return renderItems(c);
+    case 'receipts': return renderStockReceipts(c);
+    case 'assets': return renderAssets(c);
     case 'settings': return renderSettings(c);
     case 'export': return renderExport(c);
     case 'customerSummary': return renderCustomerSummary(c, VIEW_CUSTOMER_NUM);
@@ -432,6 +465,7 @@ function wireDashboardRowActions(tbody) {
         if (confirm(`Delete ${doc.number}? This cannot be undone.`)) {
           const { error } = await supabaseClient.from('documents').delete().eq('id', id);
           if (error) { alert('Could not delete — ' + error.message); return; }
+          if (doc.type === 'invoice' && doc.stockDeducted) await adjustStockForInvoice(doc, 1);
           STATE.documents = STATE.documents.filter(x => x.id !== id);
           refreshDashboardBody();
         }
@@ -448,7 +482,26 @@ function refreshDashboardBody() {
 }
 
 function renderDashboard(c) {
+  const threshold = STATE.company.reorderThreshold;
+  const lowStockItems = STATE.items.filter(x => x.stockQty !== null && x.stockQty < threshold);
+  const lowStockCard = lowStockItems.length ? `
+    <div class="card" style="border-color:var(--danger);">
+      <div class="flex-between">
+        <h2 style="border-color:var(--danger);color:var(--danger);">⚠ ${lowStockItems.length} item${lowStockItems.length===1?'':'s'} below reorder level (${threshold})</h2>
+        <button class="btn ghost small" id="goToItemsBtn">View in Items</button>
+      </div>
+      <table class="data">
+        <thead><tr><th>Code</th><th>Description</th><th>Stock Qty</th></tr></thead>
+        <tbody>
+          ${lowStockItems.slice(0, 10).map(x => `<tr><td>${esc(x.code)}</td><td>${esc(x.desc)}</td><td>${x.stockQty}</td></tr>`).join('')}
+        </tbody>
+      </table>
+      ${lowStockItems.length > 10 ? `<p class="note">+ ${lowStockItems.length - 10} more — see the Items tab for the full list.</p>` : ''}
+    </div>
+  ` : '';
+
   c.innerHTML = `
+    ${lowStockCard}
     <div class="card">
       <div class="toolbar">
         <div style="display:flex;gap:6px;flex-wrap:wrap;" id="dashChips">
@@ -464,6 +517,9 @@ function renderDashboard(c) {
       </table>
     </div>
   `;
+  if (document.getElementById('goToItemsBtn')) {
+    document.getElementById('goToItemsBtn').onclick = () => { CURRENT_TAB = 'items'; renderNav(); renderContent(); };
+  }
   refreshDashboardBody();
   document.getElementById('dashChips').querySelectorAll('.chip').forEach(chip => chip.onclick = () => {
     dashFilter = chip.dataset.f;
@@ -493,6 +549,10 @@ async function convertQuoteToInvoice(quote) {
   inv.dueDate = addDays(inv.issueDate, 30);
   inv.quoteRef = quote.number;
   inv.exportedToQBO = false;
+  inv.stockDeducted = false;
+
+  await adjustStockForInvoice(inv, -1);
+  inv.stockDeducted = true;
 
   const { data: insData, error: insErr } = await supabaseClient.from('documents').insert(mapDocToDb(inv)).select().single();
   if (insErr) { alert(`Could not create the invoice — ${insErr.message}`); return; }
@@ -625,6 +685,7 @@ function renderCustomerSummary(c, customerNum) {
         if (confirm(`Delete ${doc.number}? This cannot be undone.`)) {
           const { error } = await supabaseClient.from('documents').delete().eq('id', id);
           if (error) { alert('Could not delete — ' + error.message); return; }
+          if (doc.type === 'invoice' && doc.stockDeducted) await adjustStockForInvoice(doc, 1);
           STATE.documents = STATE.documents.filter(x => x.id !== id);
           renderCustomerSummary(c, customerNum);
         }
@@ -859,12 +920,16 @@ function wireBuilderEvents(type) {
   const custSearch = document.getElementById('custSearch');
   const custResults = document.getElementById('custResults');
   if (custSearch) {
-    custSearch.oninput = e => {
-      const q = e.target.value.toLowerCase();
-      if (q.length < 1) { custResults.style.display = 'none'; return; }
-      const matches = STATE.customers.filter(c => c.name.toLowerCase().includes(q) || String(c.num).includes(q)).slice(0, 10);
-      if (!matches.length) { custResults.innerHTML = '<div style="color:var(--steel);">No matches</div>'; custResults.style.display='block'; return; }
-      custResults.innerHTML = matches.map(m => `<div data-num="${esc(m.num)}"><b>${esc(m.name)}</b><div class="meta">#${esc(m.num)} · ${esc(m.city)}</div></div>`).join('');
+    function showCustMatches(query) {
+      const q = query.toLowerCase().trim();
+      const matches = q.length < 1
+        ? STATE.customers.slice(0, 20)
+        : STATE.customers.filter(c => c.name.toLowerCase().includes(q) || String(c.num).includes(q)).slice(0, 20);
+      if (!matches.length) { custResults.innerHTML = '<div style="color:var(--steel);">No matches</div>'; custResults.style.display = 'block'; return; }
+      const hint = (q.length < 1 && STATE.customers.length > matches.length)
+        ? `<div style="color:var(--steel);font-style:italic;cursor:default;">Showing ${matches.length} of ${STATE.customers.length} — type to search</div>`
+        : '';
+      custResults.innerHTML = hint + matches.map(m => `<div data-num="${esc(m.num)}"><b>${esc(m.name)}</b><div class="meta">#${esc(m.num)} · ${esc(m.city)}</div></div>`).join('');
       custResults.style.display = 'block';
       custResults.querySelectorAll('div[data-num]').forEach(opt => {
         opt.onmousedown = (ev) => {
@@ -873,7 +938,9 @@ function wireBuilderEvents(type) {
           renderContent();
         };
       });
-    };
+    }
+    custSearch.oninput = e => showCustMatches(e.target.value);
+    custSearch.onfocus = () => showCustMatches(custSearch.value);
     custSearch.onblur = () => setTimeout(() => { custResults.style.display = 'none'; }, 200);
   }
   const changeBtn = document.getElementById('changeCustBtn');
@@ -954,6 +1021,10 @@ async function saveDocument(type, preview) {
       STATE.counters[type === 'quote' ? 'quoteNum' : 'invoiceNum'] = numData;
     }
     d.status = d.status || 'Draft';
+    if (type === 'invoice' && !d.stockDeducted) {
+      await adjustStockForInvoice(d, -1);
+      d.stockDeducted = true;
+    }
     const { data: insData, error: insErr } = await supabaseClient.from('documents').insert(mapDocToDb(d)).select().single();
     if (insErr) { alert(`Could not save this ${type} — ${insErr.message}`); return; }
     d.id = insData.id;
@@ -1217,13 +1288,127 @@ function renderCustomers(c) {
 
 /* ===================== Items tab ===================== */
 let itemSearchTab = '';
+let itemLowStockOnly = false;
+function isLowStock(x) {
+  return x.stockQty !== null && x.stockQty < STATE.company.reorderThreshold;
+}
 function itemsTabRowsHtml() {
-  const filtered = STATE.items.filter(x => !itemSearchTab || x.desc.toLowerCase().includes(itemSearchTab.toLowerCase()) || x.code.toLowerCase().includes(itemSearchTab.toLowerCase()));
-  const rows = filtered.slice(0, 200).map(x => `
-    <tr><td>${esc(x.code)}</td><td>${esc(x.desc)}${x.isNew ? '<span class="badge-new">NEW</span>' : ''}</td><td>R ${fmtMoney(x.price)}</td><td>${x.vat}</td></tr>
-  `).join('');
+  const filtered = STATE.items.filter(x => {
+    if (itemLowStockOnly && !isLowStock(x)) return false;
+    return !itemSearchTab || x.desc.toLowerCase().includes(itemSearchTab.toLowerCase()) || x.code.toLowerCase().includes(itemSearchTab.toLowerCase());
+  });
+  const rows = filtered.slice(0, 200).map(x => {
+    const isLow = isLowStock(x);
+    const stockCell = x.stockQty === null
+      ? `<input type="number" class="stock-initial-input" min="0" placeholder="Not set" style="width:80px;">
+         <button class="btn ghost small stock-set-btn" data-code="${esc(x.code)}">Set</button>`
+      : `<b>${x.stockQty}</b>
+         <button class="btn ghost small stock-correct-btn" data-code="${esc(x.code)}" style="margin-left:6px;">Correct</button>
+         <button class="btn ghost small stock-history-btn" data-code="${esc(x.code)}">History</button>`;
+    return `
+    <tr style="${isLow ? 'background:#fef2f2;' : ''}">
+      <td>${esc(x.code)}</td>
+      <td>${esc(x.desc)}${x.isNew ? '<span class="badge-new">NEW</span>':''}${isLow ? ' <span class="pill overdue">Reorder</span>' : ''}</td>
+      <td>R ${fmtMoney(x.price)}</td>
+      <td>${x.vat}</td>
+      <td style="white-space:nowrap;">${stockCell}</td>
+    </tr>`;
+  }).join('');
   const more = filtered.length > 200 ? `<p class="note">Showing first 200 of ${filtered.length} matches — refine your search to see more.</p>` : '';
   return { rows, more };
+}
+function wireItemsTabStockInputs(tbody) {
+  tbody.querySelectorAll('.stock-set-btn').forEach(btn => {
+    btn.onclick = async () => {
+      const code = btn.dataset.code;
+      const input = btn.closest('td').querySelector('.stock-initial-input');
+      const raw = input.value.trim();
+      if (raw === '') { alert('Enter a starting quantity first.'); return; }
+      const qty = Number(raw);
+      if (!Number.isFinite(qty) || qty < 0) { alert('Enter a valid, non-negative number.'); return; }
+      if (!confirm(`Set the starting stock count to ${qty}? This can only be done once — after this, changes must go through a correction or a stock receipt.`)) return;
+      const { data: newQty, error } = await supabaseClient.rpc('set_initial_stock', { p_code: code, p_qty: qty });
+      if (error) { alert('Could not set stock — ' + error.message); return; }
+      if (newQty === null) { alert('This item already has a stock count set — refresh to see it.'); return; }
+      const item = STATE.items.find(x => x.code === code);
+      if (item) item.stockQty = newQty;
+      refreshItemsTabBody();
+    };
+  });
+  tbody.querySelectorAll('.stock-correct-btn').forEach(btn => { btn.onclick = () => openStockCorrectionModal(btn.dataset.code); });
+  tbody.querySelectorAll('.stock-history-btn').forEach(btn => { btn.onclick = () => openStockHistoryModal(btn.dataset.code); });
+}
+function openStockCorrectionModal(code) {
+  const item = STATE.items.find(x => x.code === code);
+  if (!item) return;
+  const modalHtml = `
+    <div id="stockModal" style="position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:100;display:flex;align-items:center;justify-content:center;padding:20px;" class="no-print">
+      <div style="max-width:420px;width:100%;background:#fff;border-radius:8px;overflow:hidden;">
+        <div style="padding:12px 20px;background:var(--ink);color:#fff;"><b>Correct stock — ${esc(item.desc)}</b></div>
+        <div style="padding:20px;">
+          <p class="note">Current count: <b>${item.stockQty}</b>. This is logged permanently with your name and reason — not a silent edit.</p>
+          <div class="field"><label>Correct Quantity</label><input type="number" id="corrQty" value="${item.stockQty}" min="0"></div>
+          <div class="field"><label>Reason *</label><textarea id="corrReason" rows="3" style="width:100%;padding:8px;border:1px solid var(--line);border-radius:5px;font-family:inherit;"></textarea></div>
+          <button class="btn accent small" id="corrSaveBtn">Save Correction</button>
+          <button class="btn ghost small" id="corrCancelBtn">Cancel</button>
+        </div>
+      </div>
+    </div>`;
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = modalHtml;
+  document.body.appendChild(wrapper.firstElementChild);
+  document.getElementById('corrCancelBtn').onclick = () => document.getElementById('stockModal').remove();
+  document.getElementById('corrSaveBtn').onclick = async () => {
+    const newQtyRaw = document.getElementById('corrQty').value.trim();
+    const reason = document.getElementById('corrReason').value.trim();
+    if (newQtyRaw === '' || !reason) { alert('Enter both a quantity and a reason.'); return; }
+    const newQty = Number(newQtyRaw);
+    if (!Number.isFinite(newQty) || newQty < 0) { alert('Enter a valid, non-negative number.'); return; }
+    const delta = newQty - item.stockQty;
+    if (delta === 0) { alert('That is already the current count.'); return; }
+    const { data: resultQty, error } = await supabaseClient.rpc('record_stock_movement', { p_code: code, p_delta: delta, p_type: 'correction', p_reference: null, p_notes: reason });
+    if (error) { alert('Could not save correction — ' + error.message); return; }
+    item.stockQty = resultQty;
+    document.getElementById('stockModal').remove();
+    refreshItemsTabBody();
+  };
+}
+async function openStockHistoryModal(code) {
+  const item = STATE.items.find(x => x.code === code);
+  if (!item) return;
+  const { data, error } = await supabaseClient.from('stock_movements').select('*').eq('item_code', code).order('created_at', { ascending: false });
+  const typeLabel = { initial_count: 'Initial count', correction: 'Correction', receipt: 'Stock receipt', invoice_deduct: 'Invoice', invoice_restore: 'Invoice deleted' };
+  const rows = error
+    ? `<tr><td colspan="7" style="color:var(--danger);">Could not load history — ${esc(error.message)}</td></tr>`
+    : (data && data.length ? data.map(m => `
+      <tr>
+        <td>${fmtDate((m.created_at || '').slice(0, 10))}</td>
+        <td>${esc(typeLabel[m.movement_type] || m.movement_type)}</td>
+        <td style="text-align:right;">${m.qty_change > 0 ? '+' : ''}${m.qty_change}</td>
+        <td style="text-align:right;">${m.qty_before} → ${m.qty_after}</td>
+        <td>${esc(m.reference || '')}</td>
+        <td>${esc(m.notes || '')}</td>
+        <td>${esc(m.created_by_email || '')}</td>
+      </tr>`).join('') : `<tr><td colspan="7" style="text-align:center;color:var(--steel);padding:16px;">No movements yet.</td></tr>`);
+  const modalHtml = `
+    <div id="stockModal" style="position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:100;overflow:auto;padding:24px;" class="no-print">
+      <div style="max-width:800px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden;">
+        <div style="padding:12px 20px;background:var(--ink);color:#fff;display:flex;justify-content:space-between;align-items:center;">
+          <b>Stock history — ${esc(item.desc)}</b>
+          <button class="btn ghost small" id="histCloseBtn" style="background:#fff;">Close</button>
+        </div>
+        <div style="padding:16px;max-height:70vh;overflow:auto;">
+          <table class="data">
+            <thead><tr><th>Date</th><th>Type</th><th>Change</th><th>Before → After</th><th>Reference</th><th>Notes</th><th>By</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>`;
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = modalHtml;
+  document.body.appendChild(wrapper.firstElementChild);
+  document.getElementById('histCloseBtn').onclick = () => document.getElementById('stockModal').remove();
 }
 function refreshItemsTabBody() {
   const tbody = document.getElementById('itemTabTbody');
@@ -1231,25 +1416,33 @@ function refreshItemsTabBody() {
   if (!tbody) return;
   const { rows, more } = itemsTabRowsHtml();
   tbody.innerHTML = rows;
+  wireItemsTabStockInputs(tbody);
   if (moreEl) moreEl.innerHTML = more;
 }
 function renderItems(c) {
   const { rows, more } = itemsTabRowsHtml();
+  const lowStockCount = STATE.items.filter(isLowStock).length;
   c.innerHTML = `
     <div class="card">
       <div class="toolbar">
         <h2 style="border:none;">Items <span class="note">(${STATE.items.length} total)</span></h2>
-        <input type="text" placeholder="Search…" id="itemTabSearch" value="${esc(itemSearchTab)}" style="max-width:240px;">
+        <div style="display:flex;gap:8px;align-items:center;">
+          <span class="chip ${itemLowStockOnly ? 'active' : ''}" id="lowStockChip">${lowStockCount} Low Stock</span>
+          <input type="text" placeholder="Search…" id="itemTabSearch" value="${esc(itemSearchTab)}" style="max-width:240px;">
+        </div>
       </div>
       <button class="btn accent small" id="addItemTabBtn" style="margin-bottom:12px;">+ Add Item</button>
       <div id="itemTabForm"></div>
       <table class="data">
-        <thead><tr><th>Code</th><th>Description</th><th>Price</th><th>VAT</th></tr></thead>
+        <thead><tr><th>Code</th><th>Description</th><th>Price</th><th>VAT</th><th>Stock Qty</th></tr></thead>
         <tbody id="itemTabTbody">${rows}</tbody>
       </table>
       <div id="itemTabMore">${more}</div>
+      <p class="note" style="margin-top:10px;">Setting an item's starting stock count can only be done once. After that, use <b>Correct</b> (with a reason, logged permanently) to fix a mistake, or log a <b>Stock Receipt</b> when new stock arrives. <b>History</b> shows every change ever made to an item's count. Items with no count set ("Not set") are never flagged by the reorder warning.</p>
     </div>
   `;
+  wireItemsTabStockInputs(document.getElementById('itemTabTbody'));
+  document.getElementById('lowStockChip').onclick = () => { itemLowStockOnly = !itemLowStockOnly; renderItems(c); };
   document.getElementById('itemTabSearch').oninput = e => { itemSearchTab = e.target.value; refreshItemsTabBody(); };
   document.getElementById('addItemTabBtn').onclick = () => {
     const box = document.getElementById('itemTabForm');
@@ -1262,6 +1455,9 @@ function renderItems(c) {
             <select id="tiVat"><option value="15% VAT">Standard (15%)</option><option value="VAT Free">Zero-rated</option></select>
           </div></div>
         </div>
+        <div class="row">
+          <div class="col"><div class="field"><label>Starting Stock Qty (optional)</label><input type="number" id="tiStock" placeholder="Leave blank to not track"></div></div>
+        </div>
         <button class="btn accent small" id="tiSaveBtn">Save Item</button>
         <button class="btn ghost small" id="tiCancelBtn">Cancel</button>
       </div>
@@ -1270,15 +1466,373 @@ function renderItems(c) {
     document.getElementById('tiSaveBtn').onclick = async () => {
       const desc = document.getElementById('tiDesc').value.trim();
       if (!desc) { alert('Item description is required.'); return; }
+      const stockRaw = document.getElementById('tiStock').value.trim();
       const item = await createItemRecord({
         desc, price: Number(document.getElementById('tiPrice').value) || 0,
         vat: document.getElementById('tiVat').value,
+        stockQty: stockRaw === '' ? null : (Number(stockRaw) || 0),
       });
       if (!item) return;
       box.innerHTML = '';
       refreshItemsTabBody();
     };
   };
+}
+
+/* ===================== Stock Receipts tab ===================== */
+function blankReceipt() {
+  return { supplier: '', reference: '', receiptDate: todayISO(), items: [{ code: '', desc: '', qty: 1 }], notes: '' };
+}
+let CURRENT_RECEIPT = null;
+let receiptViewMode = 'list';
+
+async function renderStockReceipts(c) {
+  if (receiptViewMode === 'new') { renderNewReceiptForm(c); return; }
+  c.innerHTML = `<div class="card"><p style="padding:20px;text-align:center;color:var(--steel);">Loading stock receipts…</p></div>`;
+  const { data, error } = await supabaseClient.from('stock_receipts').select('*').order('created_at', { ascending: false });
+  if (CURRENT_TAB !== 'receipts') return; // user navigated away while loading
+  if (error) {
+    c.innerHTML = `<div class="card"><h2 style="color:var(--danger);">Couldn't load stock receipts</h2><p>${esc(error.message)}</p></div>`;
+    return;
+  }
+  const receipts = data || [];
+  c.innerHTML = `
+    <div class="card">
+      <div class="toolbar">
+        <h2 style="border:none;">Stock Receipts <span class="note">(${receipts.length} total)</span></h2>
+        <button class="btn accent small" id="newReceiptBtn">+ New Receipt</button>
+      </div>
+      <table class="data">
+        <thead><tr><th>Date</th><th>Supplier</th><th>Reference</th><th>Items received</th><th>Logged By</th></tr></thead>
+        <tbody>
+          ${receipts.map(r => `
+            <tr>
+              <td>${fmtDate(r.receipt_date)}</td>
+              <td>${esc(r.supplier || '—')}</td>
+              <td>${esc(r.reference || '—')}</td>
+              <td>${(r.items || []).map(it => `${esc(it.desc)} (+${it.qty})`).join(', ')}</td>
+              <td>${esc(r.created_by_email || '')}</td>
+            </tr>`).join('') || `<tr><td colspan="5" style="text-align:center;color:var(--steel);padding:24px;">No stock receipts logged yet.</td></tr>`}
+        </tbody>
+      </table>
+      <p class="note" style="margin-top:10px;">Receipts are permanent once saved — they can't be edited or deleted, so the history stays reliable. If one was logged incorrectly, use a stock Correction on the affected item instead.</p>
+    </div>
+  `;
+  document.getElementById('newReceiptBtn').onclick = () => { receiptViewMode = 'new'; CURRENT_RECEIPT = blankReceipt(); renderContent(); };
+}
+
+function renderNewReceiptForm(c) {
+  const r = CURRENT_RECEIPT;
+  c.innerHTML = `
+    <div class="card">
+      <h2>New Stock Receipt</h2>
+      <div class="row">
+        <div class="col"><div class="field"><label>Supplier</label><input type="text" id="rSupplier" value="${esc(r.supplier)}"></div></div>
+        <div class="col"><div class="field"><label>Reference / Invoice No.</label><input type="text" id="rReference" value="${esc(r.reference)}"></div></div>
+        <div class="col"><div class="field"><label>Date</label><input type="date" id="rDate" value="${r.receiptDate}"></div></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Items received</h2>
+      <table class="data lineitems-table">
+        <thead><tr><th style="width:45%;">Description</th><th style="width:20%;">Code</th><th style="width:20%;">Qty Received</th><th></th></tr></thead>
+        <tbody id="receiptItemsBody"></tbody>
+      </table>
+      <button class="btn ghost small" id="rAddLineBtn" style="margin-top:8px;">+ Add Line</button>
+      <div class="field" style="margin-top:14px;max-width:400px;"><label>Notes (optional)</label><input type="text" id="rNotes" value="${esc(r.notes)}"></div>
+      <p class="note" style="margin-top:10px;">Only items that already have a stock count set can receive stock here — a receipt adds to existing tracked stock, it doesn't start tracking a new item. Set an item's starting count in the Items tab first.</p>
+    </div>
+    <div class="card">
+      <button class="btn accent" id="rSaveBtn">Save Receipt</button>
+      <button class="btn ghost" id="rCancelBtn">Cancel</button>
+    </div>
+  `;
+  renderReceiptItemsRows();
+  document.getElementById('rSupplier').oninput = e => { r.supplier = e.target.value; };
+  document.getElementById('rReference').oninput = e => { r.reference = e.target.value; };
+  document.getElementById('rDate').onchange = e => { r.receiptDate = e.target.value; };
+  document.getElementById('rNotes').oninput = e => { r.notes = e.target.value; };
+  document.getElementById('rAddLineBtn').onclick = () => { r.items.push({ code: '', desc: '', qty: 1 }); renderReceiptItemsRows(); };
+  document.getElementById('rCancelBtn').onclick = () => { receiptViewMode = 'list'; CURRENT_RECEIPT = null; renderContent(); };
+  document.getElementById('rSaveBtn').onclick = saveStockReceipt;
+}
+
+function renderReceiptItemsRows() {
+  const r = CURRENT_RECEIPT;
+  const body = document.getElementById('receiptItemsBody');
+  body.innerHTML = r.items.map((it, idx) => `
+    <tr data-idx="${idx}">
+      <td style="position:relative;">
+        <input type="text" class="ri-desc" value="${esc(it.desc)}" style="width:100%;" autocomplete="off">
+        <div class="search-results ri-desc-results" style="display:none;"></div>
+      </td>
+      <td>${esc(it.code)}</td>
+      <td><input type="number" class="ri-qty" value="${it.qty}" min="1" step="1" style="width:100%;"></td>
+      <td style="text-align:center;"><span class="remove-x" data-idx="${idx}">✕</span></td>
+    </tr>
+  `).join('');
+  body.querySelectorAll('tr').forEach(tr => {
+    const idx = Number(tr.dataset.idx);
+    const descInput = tr.querySelector('.ri-desc');
+    const resultsBox = tr.querySelector('.ri-desc-results');
+    function showTrackedMatches(query) {
+      const q = query.toLowerCase().trim();
+      const trackedItems = STATE.items.filter(x => x.stockQty !== null);
+      const matches = q.length < 1 ? trackedItems.slice(0, 20) : trackedItems.filter(x => x.desc.toLowerCase().includes(q) || x.code.toLowerCase().includes(q)).slice(0, 20);
+      if (!matches.length) { resultsBox.innerHTML = '<div style="color:var(--steel);">No tracked items match</div>'; resultsBox.style.display = 'block'; return; }
+      resultsBox.innerHTML = matches.map(m => `<div data-code="${esc(m.code)}"><b>${esc(m.desc)}</b><div class="meta">${m.code} · current stock ${m.stockQty}</div></div>`).join('');
+      resultsBox.style.display = 'block';
+      resultsBox.querySelectorAll('div[data-code]').forEach(opt => {
+        opt.onmousedown = (ev) => {
+          ev.preventDefault();
+          const item = STATE.items.find(x => x.code === opt.dataset.code);
+          if (item) { r.items[idx] = { code: item.code, desc: item.desc, qty: r.items[idx].qty || 1 }; renderReceiptItemsRows(); }
+        };
+      });
+    }
+    descInput.oninput = e => { r.items[idx].desc = e.target.value; r.items[idx].code = ''; showTrackedMatches(e.target.value); };
+    descInput.onfocus = () => showTrackedMatches(descInput.value);
+    descInput.onblur = () => setTimeout(() => { resultsBox.style.display = 'none'; }, 200);
+    tr.querySelector('.ri-qty').oninput = e => { r.items[idx].qty = e.target.value; };
+    tr.querySelector('.remove-x').onclick = () => {
+      if (r.items.length <= 1) return;
+      r.items.splice(idx, 1);
+      renderReceiptItemsRows();
+    };
+  });
+}
+
+async function saveStockReceipt() {
+  const r = CURRENT_RECEIPT;
+  const validItems = r.items.filter(it => it.code && Number(it.qty) > 0);
+  if (!validItems.length) { alert('Add at least one item (picked from the dropdown) with a valid quantity.'); return; }
+  const { data: insData, error: insErr } = await supabaseClient.from('stock_receipts').insert({
+    supplier: r.supplier, reference: r.reference, receipt_date: r.receiptDate || null,
+    items: validItems.map(it => ({ code: it.code, desc: it.desc, qty: Number(it.qty) })),
+    notes: r.notes,
+    created_by: CURRENT_USER ? CURRENT_USER.id : null, created_by_email: CURRENT_USER ? CURRENT_USER.email : null,
+  }).select().single();
+  if (insErr) { alert('Could not save receipt — ' + insErr.message); return; }
+  for (const it of validItems) {
+    const { data: newQty, error } = await supabaseClient.rpc('record_stock_movement', {
+      p_code: it.code, p_delta: Number(it.qty), p_type: 'receipt', p_reference: r.reference || insData.id, p_notes: r.notes || null,
+    });
+    if (!error && newQty !== null) {
+      const item = STATE.items.find(x => x.code === it.code);
+      if (item) item.stockQty = newQty;
+    }
+  }
+  receiptViewMode = 'list';
+  CURRENT_RECEIPT = null;
+  renderContent();
+  alert('Stock receipt saved and stock updated.');
+}
+
+/* ===================== Assets tab ===================== */
+function computeDepreciation(asset) {
+  const cost = Number(asset.purchase_cost) || 0;
+  const salvage = Number(asset.salvage_value) || 0;
+  const life = Number(asset.useful_life_years) || 0;
+  if (!asset.purchase_date || !life || cost <= 0) return { accumulated: 0, netBookValue: cost };
+  const depreciable = Math.max(cost - salvage, 0);
+  const annual = depreciable / life;
+  const asOf = asset.disposal_date ? new Date(asset.disposal_date) : new Date();
+  const purchaseDate = new Date(asset.purchase_date);
+  const yearsElapsed = Math.max(0, (asOf - purchaseDate) / (365.25 * 24 * 3600 * 1000));
+  const accumulated = Math.min(annual * yearsElapsed, depreciable);
+  return { accumulated, netBookValue: cost - accumulated };
+}
+
+let assetSearchTab = '';
+let assetStatusFilter = 'all';
+
+async function renderAssets(c) {
+  c.innerHTML = `<div class="card"><p style="padding:20px;text-align:center;color:var(--steel);">Loading assets…</p></div>`;
+  const { data, error } = await supabaseClient.from('assets').select('*').order('asset_number');
+  if (CURRENT_TAB !== 'assets') return;
+  if (error) {
+    c.innerHTML = `<div class="card"><h2 style="color:var(--danger);">Couldn't load assets</h2><p>${esc(error.message)}</p></div>`;
+    return;
+  }
+  window.__ASSETS_CACHE__ = data || [];
+  renderAssetsList(c);
+}
+
+function renderAssetsList(c) {
+  const assets = window.__ASSETS_CACHE__ || [];
+  const filtered = assets.filter(a => {
+    if (assetStatusFilter !== 'all' && a.status !== assetStatusFilter) return false;
+    if (!assetSearchTab) return true;
+    const s = assetSearchTab.toLowerCase();
+    return (a.name || '').toLowerCase().includes(s) || (a.registration_or_serial || '').toLowerCase().includes(s) || (a.asset_number || '').toLowerCase().includes(s);
+  });
+  c.innerHTML = `
+    <div class="card">
+      <div class="toolbar">
+        <h2 style="border:none;">Assets <span class="note">(${assets.length} total)</span></h2>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          ${['all', 'In Use', 'Under Repair', 'Disposed'].map(s => `<span class="chip ${assetStatusFilter === s ? 'active' : ''}" data-status="${esc(s)}">${esc(s === 'all' ? 'All' : s)}</span>`).join('')}
+          <input type="text" placeholder="Search…" id="assetSearch" value="${esc(assetSearchTab)}" style="max-width:200px;">
+        </div>
+      </div>
+      <button class="btn accent small" id="addAssetBtn" style="margin-bottom:12px;">+ Add Asset</button>
+      <button class="btn ghost small" id="exportAssetsBtn" style="margin-bottom:12px;">Export Register (CSV)</button>
+      <div id="assetForm"></div>
+      <table class="data">
+        <thead><tr><th>Asset #</th><th>Name</th><th>Category</th><th>Reg/Serial</th><th>Status</th><th>Cost</th><th>Net Book Value</th><th>Actions</th></tr></thead>
+        <tbody>
+          ${filtered.map(a => {
+            const dep = computeDepreciation(a);
+            const statusPill = a.status === 'Disposed' ? 'overdue' : a.status === 'Under Repair' ? 'sent' : 'accepted';
+            return `
+            <tr>
+              <td>${esc(a.asset_number || '—')}</td>
+              <td>${esc(a.name)}</td>
+              <td>${esc(a.category || '—')}</td>
+              <td>${esc(a.registration_or_serial || '—')}</td>
+              <td><span class="pill ${statusPill}">${esc(a.status)}</span></td>
+              <td>R ${fmtMoney(a.purchase_cost)}</td>
+              <td>R ${fmtMoney(dep.netBookValue)}</td>
+              <td style="white-space:nowrap;">
+                <button class="btn ghost small" data-act="edit" data-id="${a.id}">Edit</button>
+                ${a.status !== 'Disposed' ? `<button class="btn small" data-act="dispose" data-id="${a.id}">Dispose</button>` : ''}
+                <button class="btn danger small" data-act="delete" data-id="${a.id}">Delete</button>
+              </td>
+            </tr>`;
+          }).join('') || `<tr><td colspan="8" style="text-align:center;color:var(--steel);padding:24px;">No assets recorded yet.</td></tr>`}
+        </tbody>
+      </table>
+      <p class="note" style="margin-top:10px;">Depreciation is straight-line, calculated live as of today (or the disposal date): cost minus salvage value, spread evenly over the useful life. For a different method, use this register's cost/date/life figures as your source and calculate separately.</p>
+    </div>
+  `;
+  document.querySelectorAll('[data-status]').forEach(chip => { chip.onclick = () => { assetStatusFilter = chip.dataset.status; renderAssetsList(c); }; });
+  document.getElementById('assetSearch').oninput = e => { assetSearchTab = e.target.value; renderAssetsList(c); };
+  document.getElementById('addAssetBtn').onclick = () => renderAssetForm(c, null);
+  document.getElementById('exportAssetsBtn').onclick = () => exportAssetRegister();
+  document.querySelectorAll('button[data-act]').forEach(btn => {
+    btn.onclick = async () => {
+      const id = btn.dataset.id;
+      const asset = (window.__ASSETS_CACHE__ || []).find(a => a.id === id);
+      if (!asset) return;
+      if (btn.dataset.act === 'edit') renderAssetForm(c, asset);
+      if (btn.dataset.act === 'dispose') openDisposeModal(asset, c);
+      if (btn.dataset.act === 'delete') await deleteAsset(asset, c);
+    };
+  });
+}
+
+function renderAssetForm(c, existing) {
+  const box = document.getElementById('assetForm');
+  const a = existing || { name: '', category: 'Vehicle', registration_or_serial: '', location: '', purchase_date: '', purchase_cost: '', useful_life_years: '', salvage_value: 0, notes: '' };
+  box.innerHTML = `
+    <div class="card" style="background:var(--paper);">
+      <h2 style="border:none;">${existing ? 'Edit Asset' : 'Add Asset'}</h2>
+      <div class="row">
+        <div class="col"><div class="field"><label>Name *</label><input type="text" id="aName" value="${esc(a.name)}"></div></div>
+        <div class="col"><div class="field"><label>Category</label>
+          <select id="aCategory">${['Vehicle', 'Machinery', 'Equipment', 'Other'].map(o => `<option value="${o}" ${a.category === o ? 'selected' : ''}>${o}</option>`).join('')}</select>
+        </div></div>
+        <div class="col"><div class="field"><label>Registration / Serial No.</label><input type="text" id="aReg" value="${esc(a.registration_or_serial)}"></div></div>
+      </div>
+      <div class="row">
+        <div class="col"><div class="field"><label>Location</label><input type="text" id="aLocation" value="${esc(a.location)}"></div></div>
+        <div class="col"><div class="field"><label>Purchase Date</label><input type="date" id="aPurchaseDate" value="${a.purchase_date || ''}"></div></div>
+        <div class="col"><div class="field"><label>Purchase Cost (R)</label><input type="number" step="0.01" id="aCost" value="${a.purchase_cost || ''}"></div></div>
+      </div>
+      <div class="row">
+        <div class="col"><div class="field"><label>Useful Life (years)</label><input type="number" step="0.5" id="aLife" value="${a.useful_life_years || ''}"></div></div>
+        <div class="col"><div class="field"><label>Salvage Value (R)</label><input type="number" step="0.01" id="aSalvage" value="${a.salvage_value != null ? a.salvage_value : 0}"></div></div>
+      </div>
+      <div class="field"><label>Notes</label><input type="text" id="aNotes" value="${esc(a.notes || '')}"></div>
+      <button class="btn accent small" id="aSaveBtn">${existing ? 'Save Changes' : 'Add Asset'}</button>
+      <button class="btn ghost small" id="aCancelBtn">Cancel</button>
+    </div>
+  `;
+  document.getElementById('aCancelBtn').onclick = () => { box.innerHTML = ''; };
+  document.getElementById('aSaveBtn').onclick = async () => {
+    const name = document.getElementById('aName').value.trim();
+    if (!name) { alert('Asset name is required.'); return; }
+    const fields = {
+      name,
+      category: document.getElementById('aCategory').value,
+      registration_or_serial: document.getElementById('aReg').value.trim(),
+      location: document.getElementById('aLocation').value.trim(),
+      purchase_date: document.getElementById('aPurchaseDate').value || null,
+      purchase_cost: document.getElementById('aCost').value === '' ? null : Number(document.getElementById('aCost').value),
+      useful_life_years: document.getElementById('aLife').value === '' ? null : Number(document.getElementById('aLife').value),
+      salvage_value: Number(document.getElementById('aSalvage').value) || 0,
+      notes: document.getElementById('aNotes').value.trim(),
+    };
+    if (existing) {
+      const { error } = await supabaseClient.from('assets').update(fields).eq('id', existing.id);
+      if (error) { alert('Could not save changes — ' + error.message); return; }
+      Object.assign(existing, fields);
+    } else {
+      const { data: numData, error: numErr } = await supabaseClient.rpc('next_asset_number');
+      if (numErr) { alert('Could not assign an asset number — ' + numErr.message); return; }
+      const assetNumber = `AST-${String(numData).padStart(4, '0')}`;
+      const newAsset = { asset_number: assetNumber, status: 'In Use', ...fields, created_by: CURRENT_USER ? CURRENT_USER.id : null, created_by_email: CURRENT_USER ? CURRENT_USER.email : null };
+      const { data: insData, error: insErr } = await supabaseClient.from('assets').insert(newAsset).select().single();
+      if (insErr) { alert('Could not add asset — ' + insErr.message); return; }
+      window.__ASSETS_CACHE__ = window.__ASSETS_CACHE__ || [];
+      window.__ASSETS_CACHE__.push(insData);
+    }
+    box.innerHTML = '';
+    renderAssetsList(c);
+  };
+}
+
+function openDisposeModal(asset, c) {
+  const modalHtml = `
+    <div id="disposeModal" style="position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:100;display:flex;align-items:center;justify-content:center;padding:20px;" class="no-print">
+      <div style="max-width:420px;width:100%;background:#fff;border-radius:8px;overflow:hidden;">
+        <div style="padding:12px 20px;background:var(--ink);color:#fff;"><b>Dispose — ${esc(asset.name)}</b></div>
+        <div style="padding:20px;">
+          <div class="field"><label>Disposal Date</label><input type="date" id="dispDate" value="${todayISO()}"></div>
+          <div class="field"><label>Notes (optional)</label><input type="text" id="dispNotes" value=""></div>
+          <button class="btn accent small" id="dispSaveBtn">Confirm Disposal</button>
+          <button class="btn ghost small" id="dispCancelBtn">Cancel</button>
+        </div>
+      </div>
+    </div>`;
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = modalHtml;
+  document.body.appendChild(wrapper.firstElementChild);
+  document.getElementById('dispCancelBtn').onclick = () => document.getElementById('disposeModal').remove();
+  document.getElementById('dispSaveBtn').onclick = async () => {
+    const dateStr = document.getElementById('dispDate').value;
+    const notes = document.getElementById('dispNotes').value.trim();
+    if (!dateStr) { alert('Enter a disposal date.'); return; }
+    const { error } = await supabaseClient.from('assets').update({ status: 'Disposed', disposal_date: dateStr, disposal_notes: notes }).eq('id', asset.id);
+    if (error) { alert('Could not mark as disposed — ' + error.message); return; }
+    asset.status = 'Disposed'; asset.disposal_date = dateStr; asset.disposal_notes = notes;
+    document.getElementById('disposeModal').remove();
+    renderAssetsList(c);
+  };
+}
+
+async function deleteAsset(asset, c) {
+  if (!confirm(`Delete asset "${asset.name}"? This removes it entirely — if it was ever a real asset, consider Dispose instead to keep the record for prior-year comparisons. This cannot be undone.`)) return;
+  const { error } = await supabaseClient.from('assets').delete().eq('id', asset.id);
+  if (error) { alert('Could not delete — ' + error.message); return; }
+  window.__ASSETS_CACHE__ = (window.__ASSETS_CACHE__ || []).filter(a => a.id !== asset.id);
+  renderAssetsList(c);
+}
+
+function exportAssetRegister() {
+  const assets = window.__ASSETS_CACHE__ || [];
+  const header = ['Asset No', 'Name', 'Category', 'Registration/Serial', 'Location', 'Status', 'Purchase Date', 'Purchase Cost', 'Useful Life (yrs)', 'Salvage Value', 'Accumulated Depreciation', 'Net Book Value', 'Disposal Date', 'Disposal Notes'];
+  const rows = [header];
+  assets.forEach(a => {
+    const dep = computeDepreciation(a);
+    rows.push([
+      a.asset_number || '', a.name, a.category || '', a.registration_or_serial || '', a.location || '', a.status,
+      a.purchase_date || '', a.purchase_cost != null ? Number(a.purchase_cost).toFixed(2) : '', a.useful_life_years || '',
+      a.salvage_value != null ? Number(a.salvage_value).toFixed(2) : '', dep.accumulated.toFixed(2), dep.netBookValue.toFixed(2),
+      a.disposal_date || '', a.disposal_notes || '',
+    ]);
+  });
+  downloadCSV(`hakuna_asset_register_${todayISO()}.csv`, rows);
 }
 
 /* ===================== Settings tab ===================== */
@@ -1304,12 +1858,21 @@ function renderSettings(c) {
         <div class="col"><div class="field"><label>Next Invoice No.</label><input type="number" id="nextInvoiceNum" value="${STATE.counters.invoiceNum}"></div></div>
         <div class="col"><div class="field"><label>Next Customer No.</label><input type="number" id="nextCustNum" value="${STATE.counters.customerNum}"></div></div>
       </div>
+      <h2>Stock reorder warning</h2>
+      <div class="row">
+        <div class="col" style="max-width:260px;">
+          <div class="field"><label>Warn when stock falls below</label><input type="number" min="0" data-co="reorderThreshold" value="${co.reorderThreshold}"></div>
+        </div>
+      </div>
+      <p class="note" style="margin-top:-6px;">Applies to every item that has a stock quantity set (Items tab). Items left "Not tracked" are never flagged.</p>
       <button class="btn accent" id="saveSettingsBtn">Save Settings</button>
       <p class="note" style="margin-top:14px;">Only signed-in staff accounts can see or change this data.</p>
     </div>
   `;
   document.getElementById('saveSettingsBtn').onclick = async () => {
-    document.querySelectorAll('input[data-co]').forEach(inp => { STATE.company[inp.dataset.co] = inp.value; });
+    document.querySelectorAll('input[data-co]').forEach(inp => {
+      STATE.company[inp.dataset.co] = inp.type === 'number' ? Number(inp.value) : inp.value;
+    });
     const newQuoteNum = Number(document.getElementById('nextQuoteNum').value) || STATE.counters.quoteNum;
     const newInvoiceNum = Number(document.getElementById('nextInvoiceNum').value) || STATE.counters.invoiceNum;
     const newCustNum = Number(document.getElementById('nextCustNum').value) || STATE.counters.customerNum;
