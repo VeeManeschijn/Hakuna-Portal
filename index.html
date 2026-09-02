@@ -163,16 +163,7 @@
 
 <div id="printArea"></div>
 
-<script>
-// ============================================================
-// CONFIG — fill these in with your own Supabase project values
-// (Supabase Dashboard > Project Settings > API)
-// The anon key is safe to expose in client-side code by design —
-// Row Level Security on the database is what actually protects the data.
-// ============================================================
-window.__SUPABASE_URL__ = 'https://yrkgbfixzbztbbblxfxw.supabase.co';
-window.__SUPABASE_ANON_KEY__ = 'sb_publishable_3fl5Z9i3NAfwlWHDG2s21g_wZzsFvwn';
-</script>
+<script src="config.js"></script>
 <script>
 /* ===================== Hakuna Matata Quotes & Invoices — Supabase edition ===================== */
 /* Data lives in Supabase (Postgres) behind Row Level Security. Only staff
@@ -767,16 +758,16 @@ function applyItemToRow(idx, item) {
 }
 
 function attachItemAutocomplete(inputEl, resultsBox, idx, matchType) {
-  inputEl.oninput = e => {
-    const val = e.target.value;
-    CURRENT_DRAFT.items[idx][matchType === 'code' ? 'code' : 'desc'] = val;
-    const q = val.toLowerCase().trim();
-    if (q.length < 1) { resultsBox.style.display = 'none'; return; }
-    const matches = STATE.items.filter(it =>
-      matchType === 'code' ? it.code.toLowerCase().includes(q) : it.desc.toLowerCase().includes(q)
-    ).slice(0, 8);
+  function showMatches(query) {
+    const q = query.toLowerCase().trim();
+    const matches = q.length < 1
+      ? STATE.items.slice(0, 20)
+      : STATE.items.filter(it => matchType === 'code' ? it.code.toLowerCase().includes(q) : it.desc.toLowerCase().includes(q)).slice(0, 20);
     if (!matches.length) { resultsBox.innerHTML = '<div style="color:var(--steel);">No matching items</div>'; resultsBox.style.display = 'block'; return; }
-    resultsBox.innerHTML = matches.map(m => `<div data-code="${esc(m.code)}"><b>${esc(matchType==='code' ? m.code : m.desc)}</b><div class="meta">${esc(matchType==='code' ? m.desc : m.code)} · R ${fmtMoney(m.price)} · ${m.vat==='VAT Free'?'Zero-rated':'Standard'}</div></div>`).join('');
+    const hint = (q.length < 1 && STATE.items.length > matches.length)
+      ? `<div style="color:var(--steel);font-style:italic;cursor:default;">Showing ${matches.length} of ${STATE.items.length} — type to search</div>`
+      : '';
+    resultsBox.innerHTML = hint + matches.map(m => `<div data-code="${esc(m.code)}"><b>${esc(matchType==='code' ? m.code : m.desc)}</b><div class="meta">${esc(matchType==='code' ? m.desc : m.code)} · R ${fmtMoney(m.price)} · ${m.vat==='VAT Free'?'Zero-rated':'Standard'}</div></div>`).join('');
     resultsBox.style.display = 'block';
     resultsBox.querySelectorAll('div[data-code]').forEach(opt => {
       // mousedown fires before blur, so selection registers even though the
@@ -787,8 +778,13 @@ function attachItemAutocomplete(inputEl, resultsBox, idx, matchType) {
         if (item) applyItemToRow(idx, item);
       };
     });
+  }
+  inputEl.oninput = e => {
+    const val = e.target.value;
+    CURRENT_DRAFT.items[idx][matchType === 'code' ? 'code' : 'desc'] = val;
+    showMatches(val);
   };
-  inputEl.onfocus = () => { if (inputEl.value.trim().length >= 1) inputEl.oninput({ target: inputEl }); };
+  inputEl.onfocus = () => showMatches(inputEl.value);
   inputEl.onblur = () => setTimeout(() => { resultsBox.style.display = 'none'; }, 200);
 }
 
