@@ -1751,7 +1751,7 @@ function renderAssetsList(c) {
               <td>R ${fmtMoney(dep.netBookValue)}</td>
               <td style="white-space:nowrap;">
                 <button class="btn ghost small" data-act="edit" data-id="${a.id}">Edit</button>
-                ${a.status !== 'Disposed' ? `<button class="btn small" data-act="dispose" data-id="${a.id}">Dispose</button>` : ''}
+                ${a.status !== 'Disposed' ? `<button class="btn small" data-act="dispose" data-id="${a.id}">Dispose</button>` : `<button class="btn small" data-act="reinstate" data-id="${a.id}">Reinstate</button>`}
                 <button class="btn danger small" data-act="delete" data-id="${a.id}">Delete</button>
               </td>
             </tr>`;
@@ -1772,6 +1772,7 @@ function renderAssetsList(c) {
       if (!asset) return;
       if (btn.dataset.act === 'edit') renderAssetForm(c, asset);
       if (btn.dataset.act === 'dispose') openDisposeModal(asset, c);
+      if (btn.dataset.act === 'reinstate') await reinstateAsset(asset, c);
       if (btn.dataset.act === 'delete') await deleteAsset(asset, c);
     };
   });
@@ -1779,7 +1780,8 @@ function renderAssetsList(c) {
 
 function renderAssetForm(c, existing) {
   const box = document.getElementById('assetForm');
-  const a = existing || { name: '', category: 'Vehicle', registration_or_serial: '', location: '', purchase_date: '', purchase_cost: '', useful_life_years: '', salvage_value: 0, notes: '' };
+  const a = existing || { name: '', category: 'Vehicle', registration_or_serial: '', location: '', status: 'In Use', purchase_date: '', purchase_cost: '', useful_life_years: '', salvage_value: 0, notes: '' };
+  const editingDisposed = existing && existing.status === 'Disposed';
   box.innerHTML = `
     <div class="card" style="background:var(--paper);">
       <h2 style="border:none;">${existing ? 'Edit Asset' : 'Add Asset'}</h2>
@@ -1791,20 +1793,33 @@ function renderAssetForm(c, existing) {
         <div class="col"><div class="field"><label>Registration / Serial No.</label><input type="text" id="aReg" value="${esc(a.registration_or_serial)}"></div></div>
       </div>
       <div class="row">
-        <div class="col"><div class="field"><label>Location</label><input type="text" id="aLocation" value="${esc(a.location)}"></div></div>
-        <div class="col"><div class="field"><label>Purchase Date</label><input type="date" id="aPurchaseDate" value="${a.purchase_date || ''}"></div></div>
-        <div class="col"><div class="field"><label>Purchase Cost (R)</label><input type="number" step="0.01" id="aCost" value="${a.purchase_cost || ''}"></div></div>
+        <div class="col"><div class="field"><label>Status</label>
+          ${editingDisposed
+            ? `<input type="text" value="Disposed" disabled style="background:#f0f0f0;">
+               <p class="note" style="margin-top:4px;">Disposed assets can't be edited here — use <b>Reinstate</b> from the list to bring this back to "In Use" first.</p>`
+            : `<select id="aStatus">
+                 <option value="In Use" ${a.status === 'In Use' ? 'selected' : ''}>In Use</option>
+                 <option value="Under Repair" ${a.status === 'Under Repair' ? 'selected' : ''}>Under Repair</option>
+               </select>
+               <p class="note" style="margin-top:4px;">To retire this asset, use <b>Dispose</b> from the list instead — it records a disposal date for depreciation.</p>`}
+        </div></div>
+        <div class="col"><div class="field"><label>Location</label><input type="text" id="aLocation" value="${esc(a.location)}" ${editingDisposed ? 'disabled' : ''}></div></div>
       </div>
       <div class="row">
-        <div class="col"><div class="field"><label>Useful Life (years)</label><input type="number" step="0.5" id="aLife" value="${a.useful_life_years || ''}"></div></div>
-        <div class="col"><div class="field"><label>Salvage Value (R)</label><input type="number" step="0.01" id="aSalvage" value="${a.salvage_value != null ? a.salvage_value : 0}"></div></div>
+        <div class="col"><div class="field"><label>Purchase Date</label><input type="date" id="aPurchaseDate" value="${a.purchase_date || ''}" ${editingDisposed ? 'disabled' : ''}></div></div>
+        <div class="col"><div class="field"><label>Purchase Cost (R)</label><input type="number" step="0.01" id="aCost" value="${a.purchase_cost || ''}" ${editingDisposed ? 'disabled' : ''}></div></div>
+        <div class="col"><div class="field"><label>Useful Life (years)</label><input type="number" step="0.5" id="aLife" value="${a.useful_life_years || ''}" ${editingDisposed ? 'disabled' : ''}></div></div>
       </div>
-      <div class="field"><label>Notes</label><input type="text" id="aNotes" value="${esc(a.notes || '')}"></div>
-      <button class="btn accent small" id="aSaveBtn">${existing ? 'Save Changes' : 'Add Asset'}</button>
+      <div class="row">
+        <div class="col"><div class="field"><label>Salvage Value (R)</label><input type="number" step="0.01" id="aSalvage" value="${a.salvage_value != null ? a.salvage_value : 0}" ${editingDisposed ? 'disabled' : ''}></div></div>
+      </div>
+      <div class="field"><label>Notes</label><input type="text" id="aNotes" value="${esc(a.notes || '')}" ${editingDisposed ? 'disabled' : ''}></div>
+      ${editingDisposed ? '' : `<button class="btn accent small" id="aSaveBtn">${existing ? 'Save Changes' : 'Add Asset'}</button>`}
       <button class="btn ghost small" id="aCancelBtn">Cancel</button>
     </div>
   `;
   document.getElementById('aCancelBtn').onclick = () => { box.innerHTML = ''; };
+  if (editingDisposed) return;
   document.getElementById('aSaveBtn').onclick = async () => {
     const name = document.getElementById('aName').value.trim();
     if (!name) { alert('Asset name is required.'); return; }
@@ -1813,6 +1828,7 @@ function renderAssetForm(c, existing) {
       category: document.getElementById('aCategory').value,
       registration_or_serial: document.getElementById('aReg').value.trim(),
       location: document.getElementById('aLocation').value.trim(),
+      status: document.getElementById('aStatus').value,
       purchase_date: document.getElementById('aPurchaseDate').value || null,
       purchase_cost: document.getElementById('aCost').value === '' ? null : Number(document.getElementById('aCost').value),
       useful_life_years: document.getElementById('aLife').value === '' ? null : Number(document.getElementById('aLife').value),
@@ -1827,7 +1843,7 @@ function renderAssetForm(c, existing) {
       const { data: numData, error: numErr } = await supabaseClient.rpc('next_asset_number');
       if (numErr) { alert('Could not assign an asset number — ' + numErr.message); return; }
       const assetNumber = `AST-${String(numData).padStart(4, '0')}`;
-      const newAsset = { asset_number: assetNumber, status: 'In Use', ...fields, created_by: CURRENT_USER ? CURRENT_USER.id : null, created_by_email: CURRENT_USER ? CURRENT_USER.email : null };
+      const newAsset = { asset_number: assetNumber, ...fields, created_by: CURRENT_USER ? CURRENT_USER.id : null, created_by_email: CURRENT_USER ? CURRENT_USER.email : null };
       const { data: insData, error: insErr } = await supabaseClient.from('assets').insert(newAsset).select().single();
       if (insErr) { alert('Could not add asset — ' + insErr.message); return; }
       window.__ASSETS_CACHE__ = window.__ASSETS_CACHE__ || [];
@@ -1865,6 +1881,14 @@ function openDisposeModal(asset, c) {
     document.getElementById('disposeModal').remove();
     renderAssetsList(c);
   };
+}
+
+async function reinstateAsset(asset, c) {
+  if (!confirm(`Reinstate "${asset.name}" back to "In Use"? This clears its disposal date/notes — use this if it was disposed by mistake or has come back into service.`)) return;
+  const { error } = await supabaseClient.from('assets').update({ status: 'In Use', disposal_date: null, disposal_notes: null }).eq('id', asset.id);
+  if (error) { alert('Could not reinstate — ' + error.message); return; }
+  asset.status = 'In Use'; asset.disposal_date = null; asset.disposal_notes = null;
+  renderAssetsList(c);
 }
 
 async function deleteAsset(asset, c) {
