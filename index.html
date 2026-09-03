@@ -706,7 +706,7 @@ function blankDraft(type) {
     quoteRef: '',
     issueDate: todayISO(),
     dueDate: type === 'invoice' ? addDays(todayISO(), 30) : '',
-    items: [{ code: '', desc: '', qty: 1, rate: 0, vat: 'Standard' }],
+    items: [{ code: '', desc: '', qty: 1, rate: 0, vat: 'Standard', notes: '' }],
     subtotal: 0, taxTotal: 0, total: 0,
     exportedToQBO: false,
     createdAt: new Date().toISOString(),
@@ -813,6 +813,7 @@ function applyItemToRow(idx, item) {
     qty: CURRENT_DRAFT.items[idx].qty || 1,
     rate: item.price,
     vat: item.vat === 'VAT Free' ? 'Zero-rated' : 'Standard',
+    notes: CURRENT_DRAFT.items[idx].notes || '',
   };
   renderLineItemsRows();
   updateTotalsDisplay();
@@ -861,6 +862,7 @@ function renderLineItemsRows() {
       <td style="position:relative;">
         <input type="text" class="li-desc" value="${esc(it.desc)}" style="width:100%;" autocomplete="off">
         <div class="search-results li-desc-results" style="display:none;"></div>
+        <input type="text" class="li-notes" value="${esc(it.notes || '')}" placeholder="Add details for this item (optional)" style="width:100%;margin-top:4px;font-size:12px;padding:5px 8px;">
       </td>
       <td>
         <select class="li-vat">
@@ -880,6 +882,7 @@ function renderLineItemsRows() {
     attachItemAutocomplete(tr.querySelector('.li-code'), tr.querySelector('.li-code-results'), idx, 'code');
     attachItemAutocomplete(tr.querySelector('.li-desc'), tr.querySelector('.li-desc-results'), idx, 'desc');
     tr.querySelector('.li-vat').onchange = e => { CURRENT_DRAFT.items[idx].vat = e.target.value; updateTotalsDisplay(); };
+    tr.querySelector('.li-notes').oninput = e => { CURRENT_DRAFT.items[idx].notes = e.target.value; };
     tr.querySelector('.li-qty').oninput = e => { CURRENT_DRAFT.items[idx].qty = e.target.value; updateTotalsDisplay(); recomputeRowAmount(tr, idx); };
     tr.querySelector('.li-rate').oninput = e => { CURRENT_DRAFT.items[idx].rate = e.target.value; updateTotalsDisplay(); recomputeRowAmount(tr, idx); };
     tr.querySelector('.remove-x').onclick = () => {
@@ -949,7 +952,7 @@ function wireBuilderEvents(type) {
   if (addCustInlineBtn) addCustInlineBtn.onclick = () => renderInlineCustomerForm();
 
   const addLineBtn = document.getElementById('addLineBtn');
-  if (addLineBtn) addLineBtn.onclick = () => { d.items.push({ code:'', desc:'', qty:1, rate:0, vat:'Standard' }); renderLineItemsRows(); updateTotalsDisplay(); };
+  if (addLineBtn) addLineBtn.onclick = () => { d.items.push({ code:'', desc:'', qty:1, rate:0, vat:'Standard', notes: '' }); renderLineItemsRows(); updateTotalsDisplay(); };
 
   const saveBtn = document.getElementById('saveDraftBtn');
   if (saveBtn) saveBtn.onclick = () => saveDocument(type);
@@ -1063,7 +1066,9 @@ function openPrintPreview(doc) {
 
   const itemsRows = doc.items.map(it => `
     <tr>
-      <td>${esc(it.code)}</td><td>${esc(it.desc)}</td><td>${it.vat}</td>
+      <td>${esc(it.code)}</td>
+      <td>${esc(it.desc)}${it.notes ? `<div style="font-size:11px;color:var(--steel);font-style:italic;margin-top:2px;">${esc(it.notes)}</div>` : ''}</td>
+      <td>${it.vat}</td>
       <td>${it.qty}</td><td>R ${fmtMoney(it.rate)}</td><td>R ${fmtMoney((Number(it.qty)||0)*(Number(it.rate)||0))}</td>
     </tr>`).join('');
 
@@ -1308,7 +1313,9 @@ function itemsTabRowsHtml() {
     return `
     <tr style="${isLow ? 'background:#fef2f2;' : ''}">
       <td>${esc(x.code)}</td>
-      <td>${esc(x.desc)}${x.isNew ? '<span class="badge-new">NEW</span>':''}${isLow ? ' <span class="pill overdue">Reorder</span>' : ''}</td>
+      <td>${esc(x.desc)}${x.isNew ? '<span class="badge-new">NEW</span>':''}${isLow ? ' <span class="pill overdue">Reorder</span>' : ''}
+        <button class="btn ghost small item-edit-btn" data-code="${esc(x.code)}" style="margin-left:6px;">Edit</button>
+      </td>
       <td>R ${fmtMoney(x.price)}</td>
       <td>${x.vat}</td>
       <td style="white-space:nowrap;">${stockCell}</td>
@@ -1317,7 +1324,56 @@ function itemsTabRowsHtml() {
   const more = filtered.length > 200 ? `<p class="note">Showing first 200 of ${filtered.length} matches — refine your search to see more.</p>` : '';
   return { rows, more };
 }
+function openEditItemModal(code) {
+  const item = STATE.items.find(x => x.code === code);
+  if (!item) return;
+  const modalHtml = `
+    <div id="itemEditModal" style="position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:100;display:flex;align-items:center;justify-content:center;padding:20px;" class="no-print">
+      <div style="max-width:420px;width:100%;background:#fff;border-radius:8px;overflow:hidden;">
+        <div style="padding:12px 20px;background:var(--ink);color:#fff;"><b>Edit Item — ${esc(item.code)}</b></div>
+        <div style="padding:20px;">
+          <div class="field"><label>Description</label><input type="text" id="ieDesc" value="${esc(item.desc)}"></div>
+          <div class="field"><label>Price (R)</label><input type="number" step="0.01" id="iePrice" value="${item.price}"></div>
+          <div class="field"><label>VAT</label>
+            <select id="ieVat">
+              <option value="15% VAT" ${item.vat === '15% VAT' ? 'selected' : ''}>Standard (15%)</option>
+              <option value="VAT Free" ${item.vat === 'VAT Free' ? 'selected' : ''}>Zero-rated</option>
+            </select>
+          </div>
+          <button class="btn accent small" id="ieSaveBtn">Save Changes</button>
+          <button class="btn ghost small" id="ieCancelBtn">Cancel</button>
+        </div>
+      </div>
+    </div>`;
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = modalHtml;
+  document.body.appendChild(wrapper.firstElementChild);
+  document.getElementById('ieCancelBtn').onclick = () => document.getElementById('itemEditModal').remove();
+  document.getElementById('ieSaveBtn').onclick = async () => {
+    const newDesc = document.getElementById('ieDesc').value.trim();
+    if (!newDesc) { alert('Description is required.'); return; }
+    const newPrice = Number(document.getElementById('iePrice').value) || 0;
+    const newVat = document.getElementById('ieVat').value;
+    if (newDesc !== item.desc) {
+      const stockNote = item.stockQty === null ? 'not tracked' : `currently ${item.stockQty}`;
+      const ok = confirm(
+        `Rename "${item.desc}" to "${newDesc}"?\n\n` +
+        `This only changes the name shown when staff pick this item going forward. It will NOT change:\n` +
+        `• The stock quantity (${stockNote}) — renaming is not a stock movement\n` +
+        `• Any quote or invoice already created — those keep the description exactly as it was at the time\n\n` +
+        `Continue with the rename?`
+      );
+      if (!ok) return;
+    }
+    const { error } = await supabaseClient.from('items').update({ description: newDesc, price: newPrice, vat: newVat }).eq('code', code);
+    if (error) { alert('Could not save changes — ' + error.message); return; }
+    item.desc = newDesc; item.price = newPrice; item.vat = newVat;
+    document.getElementById('itemEditModal').remove();
+    refreshItemsTabBody();
+  };
+}
 function wireItemsTabStockInputs(tbody) {
+  tbody.querySelectorAll('.item-edit-btn').forEach(btn => { btn.onclick = () => openEditItemModal(btn.dataset.code); });
   tbody.querySelectorAll('.stock-set-btn').forEach(btn => {
     btn.onclick = async () => {
       const code = btn.dataset.code;
