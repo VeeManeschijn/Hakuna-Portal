@@ -108,6 +108,61 @@
     .no-print{display:none!important;}
   }
 
+  /* ============================================================
+     Mobile layout (phones) — stacks the header, makes data tables
+     display as cards instead of forcing horizontal scroll, and
+     turns the line-items table into a single-column entry form.
+     ============================================================ */
+  @media (max-width: 700px){
+    #app{padding:0 10px;}
+    header.topbar{flex-wrap:wrap;padding:12px 0;gap:8px;}
+    header.topbar img{height:40px;}
+    header.topbar h1{font-size:16px;}
+    header.topbar .sub{font-size:11px;}
+    .topbar-right{width:100%;justify-content:space-between;margin-left:0;order:3;}
+    nav.tabs{gap:5px;margin-bottom:12px;}
+    nav.tabs button{padding:8px 10px;font-size:12px;flex:1 1 auto;}
+    .card{padding:12px;}
+    .row{gap:8px;}
+    .col{min-width:100%!important;flex-basis:100%!important;}
+    .toolbar{flex-direction:column;align-items:stretch;gap:8px;}
+    .toolbar input[type=text]{max-width:100%!important;}
+    button.btn{padding:10px 14px;font-size:14px;}
+    button.btn.small{padding:8px 12px;font-size:13px;}
+
+    /* Generic data tables -> stacked cards. Each <td> needs a
+       data-label attribute (added in the JS) to show its column
+       name above the value. */
+    table.data{border:none;}
+    table.data thead{display:none;}
+    table.data, table.data tbody, table.data tr{display:block;width:100%;}
+    table.data tr{border:1px solid var(--line);border-radius:8px;margin-bottom:10px;padding:8px 10px;background:#fff;}
+    table.data tr:hover td{background:transparent;}
+    table.data td{display:block;border:none;padding:5px 0;}
+    table.data td[data-label]::before{content:attr(data-label);display:block;font-size:10px;font-weight:700;color:var(--steel);text-transform:uppercase;letter-spacing:.3px;margin-bottom:2px;}
+    table.data td:empty{display:none;}
+
+    /* Line items entry table -> one card per line item, inputs
+       stacked full-width with labels above them. */
+    table.lineitems-table thead{display:none;}
+    table.lineitems-table, table.lineitems-table tbody, table.lineitems-table tr{display:block;width:100%;}
+    table.lineitems-table tr{border:1px solid var(--line);border-radius:8px;margin-bottom:12px;padding:10px;background:#fff;}
+    table.lineitems-table td{display:block;border:none;padding:6px 0;text-align:left!important;}
+    table.lineitems-table td[data-label]::before{content:attr(data-label);display:block;font-size:10px;font-weight:700;color:var(--steel);text-transform:uppercase;letter-spacing:.3px;margin-bottom:3px;}
+    table.lineitems-table input, table.lineitems-table select{width:100%!important;}
+    table.lineitems-table .remove-x{display:inline-block;padding:6px 14px;border:1px solid var(--danger);color:var(--danger);border-radius:5px;}
+
+    .totals-box{max-width:100%;}
+    .doc-page{padding:16px 14px;}
+    .doc-header{flex-direction:column;gap:10px;}
+    .doc-header img{height:56px;align-self:flex-end;}
+    .doc-twocol{flex-direction:column;}
+    table.doc-items{font-size:11px;}
+    table.doc-items th,table.doc-items td{padding:5px 4px;}
+    .doc-banking{flex-direction:column;gap:14px;}
+    .doc-footer-row{flex-direction:column;gap:8px;}
+  }
+
   #loginScreen{min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);}
   .login-box{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:32px;max-width:360px;width:100%;box-shadow:0 10px 30px rgba(0,0,0,.08);}
   .login-box img{height:56px;display:block;margin:0 auto 14px;}
@@ -426,13 +481,13 @@ function dashboardFilteredDocs() {
 function dashboardRowsHtml(filtered) {
   return filtered.map(d => `
     <tr>
-      <td><b>${esc(d.number)}</b></td>
-      <td>${d.type === 'quote' ? 'Quote' : 'Invoice'}</td>
-      <td><a href="#" data-cust="${esc(d.customer.num)}" class="cust-link">${esc(d.customer.name)}</a></td>
-      <td>${esc(d.truckReg)}</td>
-      <td>R ${fmtMoney(d.total)}</td>
-      <td><span class="pill ${d.status.toLowerCase()}">${d.status}</span></td>
-      <td>${fmtDate(d.issueDate)}</td>
+      <td data-label="Number"><b>${esc(d.number)}</b></td>
+      <td data-label="Type">${d.type === 'quote' ? 'Quote' : 'Invoice'}</td>
+      <td data-label="Customer"><a href="#" data-cust="${esc(d.customer.num)}" class="cust-link">${esc(d.customer.name)}</a></td>
+      <td data-label="Truck Reg">${esc(d.truckReg)}</td>
+      <td data-label="Total">R ${fmtMoney(d.total)}</td>
+      <td data-label="Status"><span class="pill ${d.status.toLowerCase()}">${d.status}</span></td>
+      <td data-label="Date">${fmtDate(d.issueDate)}</td>
       <td style="white-space:nowrap;">
         <button class="btn ghost small" data-act="view" data-id="${d.id}">View</button>
         <button class="btn ghost small" data-act="edit" data-id="${d.id}">Edit</button>
@@ -614,12 +669,12 @@ function renderCustomerSummary(c, customerNum) {
         <tbody id="custSummaryTbody">
           ${docs.map(d => `
             <tr>
-              <td><b>${esc(d.number)}</b></td>
-              <td>${d.type === 'quote' ? 'Quote' : 'Invoice'}</td>
-              <td>${esc(d.truckReg)}</td>
-              <td>R ${fmtMoney(d.total)}</td>
-              <td><span class="pill ${d.status.toLowerCase()}">${d.status}</span></td>
-              <td>${fmtDate(d.issueDate)}</td>
+              <td data-label="Number"><b>${esc(d.number)}</b></td>
+              <td data-label="Type">${d.type === 'quote' ? 'Quote' : 'Invoice'}</td>
+              <td data-label="Truck Reg">${esc(d.truckReg)}</td>
+              <td data-label="Total">R ${fmtMoney(d.total)}</td>
+              <td data-label="Status"><span class="pill ${d.status.toLowerCase()}">${d.status}</span></td>
+              <td data-label="Date">${fmtDate(d.issueDate)}</td>
               <td style="white-space:nowrap;">
                 <button class="btn ghost small" data-act="view" data-id="${d.id}">View</button>
                 <button class="btn ghost small" data-act="edit" data-id="${d.id}">Edit</button>
@@ -776,7 +831,7 @@ function renderDocBuilder(c, type) {
           ['customerDepo','Customer Depo'],['poNumber','PO Number'],['jobcard','Jobcard'],
           ['tec','Tec'],['hkm','HKM']
         ].map(([k,label]) => `
-          <div class="col" style="min-width:180px;flex:0 0 22%;">
+          <div class="col" style="min-width:150px;flex:1 1 160px;">
             <div class="field"><label>${label}</label><input type="text" data-field="${k}" value="${esc(d[k])}"></div>
           </div>`).join('')}
       </div>
@@ -855,25 +910,25 @@ function renderLineItemsRows() {
   const body = document.getElementById('lineItemsBody');
   body.innerHTML = d.items.map((it, idx) => `
     <tr data-idx="${idx}">
-      <td style="position:relative;">
+      <td data-label="Code" style="position:relative;">
         <input type="text" class="li-code" value="${esc(it.code)}" style="width:100%;" autocomplete="off">
         <div class="search-results li-code-results" style="display:none;"></div>
       </td>
-      <td style="position:relative;">
+      <td data-label="Description" style="position:relative;">
         <input type="text" class="li-desc" value="${esc(it.desc)}" style="width:100%;" autocomplete="off">
         <div class="search-results li-desc-results" style="display:none;"></div>
         <input type="text" class="li-notes" value="${esc(it.notes || '')}" placeholder="Add details for this item (optional)" style="width:100%;margin-top:4px;font-size:12px;padding:5px 8px;">
       </td>
-      <td>
+      <td data-label="Tax">
         <select class="li-vat">
           <option value="Standard" ${it.vat==='Standard'?'selected':''}>Standard</option>
           <option value="Zero-rated" ${it.vat==='Zero-rated'?'selected':''}>Zero-rated</option>
         </select>
       </td>
-      <td><input type="number" class="li-qty" value="${it.qty}" min="0" step="1" style="width:100%;"></td>
-      <td><input type="number" class="li-rate" value="${it.rate}" min="0" step="0.01" style="width:100%;"></td>
-      <td style="text-align:right;padding-top:12px;">R ${fmtMoney((Number(it.qty)||0)*(Number(it.rate)||0))}</td>
-      <td style="text-align:center;padding-top:10px;"><span class="remove-x" data-idx="${idx}">✕</span></td>
+      <td data-label="Qty"><input type="number" class="li-qty" value="${it.qty}" min="0" step="1" style="width:100%;"></td>
+      <td data-label="Rate"><input type="number" class="li-rate" value="${it.rate}" min="0" step="0.01" style="width:100%;"></td>
+      <td data-label="Amount" style="text-align:right;padding-top:12px;">R ${fmtMoney((Number(it.qty)||0)*(Number(it.rate)||0))}</td>
+      <td data-label="Remove" style="text-align:center;padding-top:10px;"><span class="remove-x" data-idx="${idx}">✕</span></td>
     </tr>
   `).join('');
 
@@ -1199,8 +1254,8 @@ function customersTabRowsHtml() {
   const filtered = STATE.customers.filter(x => !custSearchTab || x.name.toLowerCase().includes(custSearchTab.toLowerCase()) || String(x.num).includes(custSearchTab));
   const rows = filtered.slice(0, 200).map(x => `
     <tr class="cust-row" data-num="${esc(x.num)}" style="cursor:pointer;">
-      <td>${esc(x.num)}</td><td>${esc(x.name)}${x.isNew ? '<span class="badge-new">NEW</span>' : ''}</td>
-      <td>${esc(x.contact)}</td><td>${esc(x.email)}</td><td>${esc(x.phone)}</td><td>${esc(x.city)}</td><td>${esc(x.vat)}</td>
+      <td data-label="#">${esc(x.num)}</td><td data-label="Name">${esc(x.name)}${x.isNew ? '<span class="badge-new">NEW</span>' : ''}</td>
+      <td data-label="Contact">${esc(x.contact)}</td><td data-label="Email">${esc(x.email)}</td><td data-label="Phone">${esc(x.phone)}</td><td data-label="City">${esc(x.city)}</td><td data-label="VAT No.">${esc(x.vat)}</td>
     </tr>
   `).join('');
   const more = filtered.length > 200 ? `<p class="note">Showing first 200 of ${filtered.length} matches — refine your search to see more.</p>` : '';
@@ -1312,13 +1367,13 @@ function itemsTabRowsHtml() {
          <button class="btn ghost small stock-history-btn" data-code="${esc(x.code)}">History</button>`;
     return `
     <tr style="${isLow ? 'background:#fef2f2;' : ''}">
-      <td>${esc(x.code)}</td>
-      <td>${esc(x.desc)}${x.isNew ? '<span class="badge-new">NEW</span>':''}${isLow ? ' <span class="pill overdue">Reorder</span>' : ''}
+      <td data-label="Code">${esc(x.code)}</td>
+      <td data-label="Description">${esc(x.desc)}${x.isNew ? '<span class="badge-new">NEW</span>':''}${isLow ? ' <span class="pill overdue">Reorder</span>' : ''}
         <button class="btn ghost small item-edit-btn" data-code="${esc(x.code)}" style="margin-left:6px;">Edit</button>
       </td>
-      <td>R ${fmtMoney(x.price)}</td>
-      <td>${x.vat}</td>
-      <td style="white-space:nowrap;">${stockCell}</td>
+      <td data-label="Price">R ${fmtMoney(x.price)}</td>
+      <td data-label="VAT">${x.vat}</td>
+      <td data-label="Stock Qty" style="white-space:nowrap;">${stockCell}</td>
     </tr>`;
   }).join('');
   const more = filtered.length > 200 ? `<p class="note">Showing first 200 of ${filtered.length} matches — refine your search to see more.</p>` : '';
@@ -1563,11 +1618,11 @@ async function renderStockReceipts(c) {
         <tbody>
           ${receipts.map(r => `
             <tr>
-              <td>${fmtDate(r.receipt_date)}</td>
-              <td>${esc(r.supplier || '—')}</td>
-              <td>${esc(r.reference || '—')}</td>
-              <td>${(r.items || []).map(it => `${esc(it.desc)} (+${it.qty})`).join(', ')}</td>
-              <td>${esc(r.created_by_email || '')}</td>
+              <td data-label="Date">${fmtDate(r.receipt_date)}</td>
+              <td data-label="Supplier">${esc(r.supplier || '—')}</td>
+              <td data-label="Reference">${esc(r.reference || '—')}</td>
+              <td data-label="Items received">${(r.items || []).map(it => `${esc(it.desc)} (+${it.qty})`).join(', ')}</td>
+              <td data-label="Logged By">${esc(r.created_by_email || '')}</td>
             </tr>`).join('') || `<tr><td colspan="5" style="text-align:center;color:var(--steel);padding:24px;">No stock receipts logged yet.</td></tr>`}
         </tbody>
       </table>
@@ -1618,13 +1673,13 @@ function renderReceiptItemsRows() {
   const body = document.getElementById('receiptItemsBody');
   body.innerHTML = r.items.map((it, idx) => `
     <tr data-idx="${idx}">
-      <td style="position:relative;">
+      <td data-label="Description" style="position:relative;">
         <input type="text" class="ri-desc" value="${esc(it.desc)}" style="width:100%;" autocomplete="off">
         <div class="search-results ri-desc-results" style="display:none;"></div>
       </td>
-      <td>${esc(it.code)}</td>
-      <td><input type="number" class="ri-qty" value="${it.qty}" min="1" step="1" style="width:100%;"></td>
-      <td style="text-align:center;"><span class="remove-x" data-idx="${idx}">✕</span></td>
+      <td data-label="Code">${esc(it.code)}</td>
+      <td data-label="Qty Received"><input type="number" class="ri-qty" value="${it.qty}" min="1" step="1" style="width:100%;"></td>
+      <td data-label="Remove" style="text-align:center;"><span class="remove-x" data-idx="${idx}">✕</span></td>
     </tr>
   `).join('');
   body.querySelectorAll('tr').forEach(tr => {
@@ -1742,13 +1797,13 @@ function renderAssetsList(c) {
             const statusPill = a.status === 'Disposed' ? 'overdue' : a.status === 'Under Repair' ? 'sent' : 'accepted';
             return `
             <tr>
-              <td>${esc(a.asset_number || '—')}</td>
-              <td>${esc(a.name)}</td>
-              <td>${esc(a.category || '—')}</td>
-              <td>${esc(a.registration_or_serial || '—')}</td>
-              <td><span class="pill ${statusPill}">${esc(a.status)}</span></td>
-              <td>R ${fmtMoney(a.purchase_cost)}</td>
-              <td>R ${fmtMoney(dep.netBookValue)}</td>
+              <td data-label="Asset #">${esc(a.asset_number || '—')}</td>
+              <td data-label="Name">${esc(a.name)}</td>
+              <td data-label="Category">${esc(a.category || '—')}</td>
+              <td data-label="Reg/Serial">${esc(a.registration_or_serial || '—')}</td>
+              <td data-label="Status"><span class="pill ${statusPill}">${esc(a.status)}</span></td>
+              <td data-label="Cost">R ${fmtMoney(a.purchase_cost)}</td>
+              <td data-label="Net Book Value">R ${fmtMoney(dep.netBookValue)}</td>
               <td style="white-space:nowrap;">
                 <button class="btn ghost small" data-act="edit" data-id="${a.id}">Edit</button>
                 ${a.status !== 'Disposed' ? `<button class="btn small" data-act="dispose" data-id="${a.id}">Dispose</button>` : `<button class="btn small" data-act="reinstate" data-id="${a.id}">Reinstate</button>`}
