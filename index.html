@@ -235,6 +235,7 @@ let CURRENT_USER = null; // { id, email }
 // buttons here just keeps the screens clean.
 let CURRENT_ROLE = 'full';
 function canManageStock() { return CURRENT_ROLE !== 'no_stock'; }
+function canExportQBO() { return CURRENT_ROLE !== 'no_stock'; }
 
 let STATE = {
   customers: [],
@@ -335,7 +336,7 @@ async function loadAll() {
     const { data: roleRow } = await supabaseClient.from('user_roles').select('role').eq('user_id', CURRENT_USER.id).maybeSingle();
     if (roleRow && roleRow.role) CURRENT_ROLE = roleRow.role;
   }
-  if (!canManageStock() && CURRENT_TAB === 'receipts') CURRENT_TAB = 'dashboard';
+  if ((!canManageStock() && CURRENT_TAB === 'receipts') || (!canExportQBO() && CURRENT_TAB === 'export')) CURRENT_TAB = 'dashboard';
   STATE.loaded = true;
   return true;
 }
@@ -579,7 +580,7 @@ let VIEW_CUSTOMER_NUM = null;
 
 function renderNav() {
   const nav = document.getElementById('tabsNav');
-  nav.innerHTML = TABS.filter(t => t.id !== 'receipts' || canManageStock()).map(t =>
+  nav.innerHTML = TABS.filter(t => (t.id !== 'receipts' || canManageStock()) && (t.id !== 'export' || canExportQBO())).map(t =>
     `<button data-tab="${t.id}" class="${CURRENT_TAB === t.id ? 'active' : ''}">${t.label}</button>`
   ).join('');
   nav.querySelectorAll('button').forEach(b => {
@@ -609,7 +610,7 @@ function renderContent() {
     case 'receipts': return canManageStock() ? renderStockReceipts(c) : renderDashboard(c);
     case 'assets': return renderAssets(c);
     case 'settings': return renderSettings(c);
-    case 'export': return renderExport(c);
+    case 'export': return canExportQBO() ? renderExport(c) : renderDashboard(c);
     case 'customerSummary': return renderCustomerSummary(c, VIEW_CUSTOMER_NUM);
   }
 }
