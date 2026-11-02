@@ -239,7 +239,7 @@ let CURRENT_USER = null; // { id, email }
 // buttons here just keeps the screens clean.
 let CURRENT_ROLE = 'full';
 function canManageStock() { return CURRENT_ROLE !== 'no_stock'; }
-function canExportQBO() { return CURRENT_ROLE !== 'no_stock'; }
+function canExportQBO() { return !['no_stock', 'no_export', 'stock_controller'].includes(CURRENT_ROLE); }
 // Roles limited to specific tabs. stock_controller only works with stock:
 // Items, Stock Receipts and Assets (full edit there), nothing else.
 const ROLE_TABS = { stock_controller: ['items', 'receipts', 'assets'] };
