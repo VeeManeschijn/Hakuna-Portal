@@ -102,10 +102,14 @@
   .doc-footer-row{display:flex;justify-content:space-between;margin-top:26px;font-size:13px;}
   .doc-footnote{font-size:10.5px;color:var(--steel);font-style:italic;margin-top:20px;}
 
+  /* Zero page margin stops the browser adding its own header/footer
+     (print date/time, page title, web address, page numbers). The
+     document's own margin is restored with padding on #printArea. */
+  @page{size:A4;margin:0;}
   @media print{
     body *{visibility:hidden;}
     #printArea, #printArea *{visibility:visible;}
-    #printArea{display:block;position:absolute;top:0;left:0;width:100%;}
+    #printArea{display:block;position:absolute;top:0;left:0;width:100%;box-sizing:border-box;padding:12mm 12mm;}
     .no-print{display:none!important;}
   }
 
