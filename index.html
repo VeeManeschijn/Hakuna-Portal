@@ -51,6 +51,7 @@
   .pill.converted{background:#ede9fe;color:#6d28d9;}
   .pill.paid{background:#dcfce7;color:#15803d;}
   .pill.overdue{background:#fee2e2;color:#b91c1c;}
+  .pill.declined{background:#f3f4f6;color:#6b7280;text-decoration:line-through;}
   .search-box{position:relative;}
   .search-results{position:absolute;z-index:20;background:#fff;border:1px solid var(--line);border-radius:5px;max-height:260px;overflow-y:auto;width:100%;box-shadow:0 6px 18px rgba(0,0,0,.12);}
   .search-results div{padding:8px 10px;cursor:pointer;font-size:13px;border-bottom:1px solid #f0f0f0;}
@@ -364,21 +365,137 @@ async function createItemRecord(fields) {
   return item;
 }
 
-// Deducts (sign=-1) or restores (sign=+1) stock for every line item on an
-// invoice that matches a catalog item. Custom/free-text line items (no
-// matching code in STATE.items) are silently skipped — nothing to track.
-async function adjustStockForInvoice(invoiceDoc, sign) {
-  const movementType = sign < 0 ? 'invoice_deduct' : 'invoice_restore';
-  for (const line of invoiceDoc.items) {
+// ---------- Stock logic ----------
+// Stock comes off when a QUOTE is saved (or when an invoice is saved that
+// did not come from a quote). It goes back when a quote is declined or a
+// document holding stock is deleted. Editing a saved document adjusts stock
+// by the difference only. Converting a quote moves its stock "hold" across
+// to the invoice, so nothing is deducted twice.
+// Custom/free-text lines (no matching tracked catalog item) are skipped.
+function trackedQtyByCode(lines) {
+  const out = {};
+  for (const line of (lines || [])) {
     const catalogItem = STATE.items.find(x => x.code === line.code);
     if (!catalogItem || catalogItem.stockQty === null) continue;
-    const delta = sign * (Number(line.qty) || 0);
-    if (!delta) continue;
-    const { data: newQty, error } = await supabaseClient.rpc('record_stock_movement', {
-      p_code: line.code, p_delta: delta, p_type: movementType, p_reference: invoiceDoc.number, p_notes: null,
-    });
-    if (!error && newQty !== null) catalogItem.stockQty = Number(newQty);
+    out[line.code] = (out[line.code] || 0) + (Number(line.qty) || 0);
   }
+  return out;
+}
+async function moveStock(code, delta, type, reference) {
+  if (!delta) return;
+  const { data: newQty, error } = await supabaseClient.rpc('record_stock_movement', {
+    p_code: code, p_delta: delta, p_type: type, p_reference: reference, p_notes: null,
+  });
+  if (error) { alert(`Stock for item ${code} could not be updated — ${error.message}`); return; }
+  const catalogItem = STATE.items.find(x => x.code === code);
+  if (catalogItem && newQty !== null) catalogItem.stockQty = Number(newQty);
+}
+// sign = -1 deducts, sign = +1 restores, for every tracked line on the document.
+async function adjustStockForDoc(doc, sign) {
+  const kind = doc.type === 'quote' ? 'quote' : 'invoice';
+  const movementType = sign < 0 ? `${kind}_deduct` : `${kind}_restore`;
+  const reference = `${kind === 'quote' ? 'Quote' : 'Invoice'} ${doc.number}`;
+  const qtys = trackedQtyByCode(doc.items);
+  for (const code of Object.keys(qtys)) await moveStock(code, sign * qtys[code], movementType, reference);
+}
+// When a saved document is edited, move only the difference per item.
+async function adjustStockForEdit(oldDoc, newDoc) {
+  const before = trackedQtyByCode(oldDoc.items);
+  const after = trackedQtyByCode(newDoc.items);
+  const codes = new Set([...Object.keys(before), ...Object.keys(after)]);
+  const kind = newDoc.type === 'quote' ? 'quote' : 'invoice';
+  const reference = `${kind === 'quote' ? 'Quote' : 'Invoice'} ${newDoc.number} (edited)`;
+  for (const code of codes) await moveStock(code, (before[code] || 0) - (after[code] || 0), `${kind}_edit`, reference);
+}
+// Warns before saving if any tracked item would go below zero. At Hakuna
+// the parts are normally already fitted by the time a quote is done, so a
+// shortfall usually means a stock receipt hasn't been logged yet, or the
+// stock count is out. Returns true to go ahead, false to cancel.
+// `deltas` = { itemCode: change } where negative means stock comes off.
+function confirmStockShortfall(deltas, docLabel) {
+  const short = [];
+  for (const code of Object.keys(deltas)) {
+    const delta = deltas[code];
+    if (delta >= 0) continue;
+    const item = STATE.items.find(x => x.code === code);
+    if (!item || item.stockQty === null) continue;
+    const after = item.stockQty + delta;
+    if (after < 0) short.push(`• ${item.desc} (${code}): ${item.stockQty} in stock, ${docLabel} uses ${-delta} → ${after}`);
+  }
+  if (!short.length) return true;
+  return confirm(
+    `Stock warning — these items will go below zero:\n\n${short.join('\n')}\n\n` +
+    `If these parts were already used on the job, a stock receipt has probably not been logged yet, or the stock count needs a correction.\n\n` +
+    `OK = save anyway (stock will show negative until it's sorted out)\nCancel = go back without saving`
+  );
+}
+function negate(obj) { const o = {}; for (const k of Object.keys(obj)) o[k] = -obj[k]; return o; }
+function editDeltas(oldDoc, newDoc) {
+  const before = trackedQtyByCode(oldDoc.items), after = trackedQtyByCode(newDoc.items), o = {};
+  for (const k of new Set([...Object.keys(before), ...Object.keys(after)])) o[k] = (before[k] || 0) - (after[k] || 0);
+  return o;
+}
+
+// Asks how a quote was declined. Resolves 'used' (parts stay fitted on the
+// job, stock stays off), 'returned' (parts back on the shelf) or null (cancel).
+function askDeclineOutcome(doc) {
+  return new Promise(resolve => {
+    const holds = !!doc.stockDeducted && Object.keys(trackedQtyByCode(doc.items)).length > 0;
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `
+      <div id="declineModal" style="position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:100;display:flex;align-items:center;justify-content:center;padding:20px;" class="no-print">
+        <div style="max-width:440px;width:100%;background:#fff;border-radius:8px;overflow:hidden;">
+          <div style="padding:12px 20px;background:var(--ink);color:#fff;"><b>Decline quote ${esc(doc.number)}</b></div>
+          <div style="padding:20px;">
+            ${holds
+              ? `<p style="margin-top:0;">Were the parts on this quote returned to stock?</p>
+                 <p class="note">Usually they were already fitted on the job, so stock stays off.</p>
+                 <div style="display:flex;flex-direction:column;gap:8px;margin-top:12px;">
+                   <button class="btn accent small" data-out="used">No — parts were used on the job (stock stays off)</button>
+                   <button class="btn small" data-out="returned">Yes — parts returned to the shelf (put stock back)</button>
+                   <button class="btn ghost small" data-out="">Cancel</button>
+                 </div>`
+              : `<p style="margin-top:0;">Mark this quote as declined? No tracked stock is attached to it.</p>
+                 <div style="display:flex;gap:8px;margin-top:12px;">
+                   <button class="btn accent small" data-out="used">Decline</button>
+                   <button class="btn ghost small" data-out="">Cancel</button>
+                 </div>`}
+          </div>
+        </div>
+      </div>`;
+    document.body.appendChild(wrap);
+    wrap.querySelectorAll('button[data-out]').forEach(btn => {
+      btn.onclick = () => { wrap.remove(); resolve(btn.dataset.out || null); };
+    });
+  });
+}
+
+// Declined + parts used: stock stays off and the quote keeps its hold
+// (stock_deducted stays true) so a later conversion won't deduct twice and
+// deleting it won't put stock back. Declined + parts returned: stock goes back.
+async function declineQuote(doc) {
+  const outcome = await askDeclineOutcome(doc);
+  if (!outcome) return false;
+  const returned = outcome === 'returned' && doc.stockDeducted;
+  const nowIso = new Date().toISOString();
+  const { error } = await supabaseClient.from('documents')
+    .update({ status: 'Declined', stock_deducted: returned ? false : !!doc.stockDeducted, updated_at: nowIso }).eq('id', doc.id);
+  if (error) { alert('Could not decline — ' + error.message); return false; }
+  if (returned) {
+    await adjustStockForDoc(doc, 1);
+    doc.stockDeducted = false;
+  } else if (doc.stockDeducted) {
+    // History note only — no quantity change.
+    for (const code of Object.keys(trackedQtyByCode(doc.items))) {
+      await supabaseClient.rpc('record_stock_movement', {
+        p_code: code, p_delta: 0, p_type: 'quote_used', p_reference: `Quote ${doc.number}`,
+        p_notes: 'Quote declined — parts used on the job, not returned to stock',
+      });
+    }
+  }
+  doc.status = 'Declined';
+  doc.updatedAt = nowIso;
+  return true;
 }
 
 function fmtMoney(n) {
@@ -492,6 +609,7 @@ function dashboardRowsHtml(filtered) {
         <button class="btn ghost small" data-act="view" data-id="${d.id}">View</button>
         <button class="btn ghost small" data-act="edit" data-id="${d.id}">Edit</button>
         ${d.type === 'quote' && d.status !== 'Converted' ? `<button class="btn accent small" data-act="convert" data-id="${d.id}">Convert to Invoice</button>` : ''}
+        ${d.type === 'quote' && d.status !== 'Converted' && d.status !== 'Declined' ? `<button class="btn ghost small" data-act="decline" data-id="${d.id}">Decline</button>` : ''}
         ${d.type === 'invoice' && d.status !== 'Paid' ? `<button class="btn small" data-act="paid" data-id="${d.id}">Mark Paid</button>` : ''}
         <button class="btn danger small" data-act="delete" data-id="${d.id}">Delete</button>
       </td>
@@ -510,6 +628,7 @@ function wireDashboardRowActions(tbody) {
       if (btn.dataset.act === 'view') { openPrintPreview(doc); }
       if (btn.dataset.act === 'edit') { loadDocIntoBuilder(doc); }
       if (btn.dataset.act === 'convert') { await convertQuoteToInvoice(doc); }
+      if (btn.dataset.act === 'decline') { if (await declineQuote(doc)) refreshDashboardBody(); }
       if (btn.dataset.act === 'paid') {
         doc.status = 'Paid'; doc.updatedAt = new Date().toISOString();
         const { error } = await supabaseClient.from('documents').update({ status: 'Paid', updated_at: doc.updatedAt }).eq('id', id);
@@ -520,7 +639,7 @@ function wireDashboardRowActions(tbody) {
         if (confirm(`Delete ${doc.number}? This cannot be undone.`)) {
           const { error } = await supabaseClient.from('documents').delete().eq('id', id);
           if (error) { alert('Could not delete — ' + error.message); return; }
-          if (doc.type === 'invoice' && doc.stockDeducted) await adjustStockForInvoice(doc, 1);
+          if (doc.stockDeducted && doc.status !== 'Declined') await adjustStockForDoc(doc, 1);
           STATE.documents = STATE.documents.filter(x => x.id !== id);
           refreshDashboardBody();
         }
@@ -560,7 +679,7 @@ function renderDashboard(c) {
     <div class="card">
       <div class="toolbar">
         <div style="display:flex;gap:6px;flex-wrap:wrap;" id="dashChips">
-          ${['all','quotes','invoices','Draft','Sent','Accepted','Converted','Paid','Overdue'].map(f =>
+          ${['all','quotes','invoices','Draft','Sent','Accepted','Converted','Declined','Paid','Overdue'].map(f =>
             `<span class="chip ${dashFilter===f?'active':''}" data-f="${f}">${f[0].toUpperCase()+f.slice(1)}</span>`
           ).join('')}
         </div>
@@ -593,6 +712,8 @@ function loadDocIntoBuilder(doc) {
 }
 
 async function convertQuoteToInvoice(quote) {
+  // Warn before an invoice number is taken, so cancelling leaves no gap.
+  if (!quote.stockDeducted && !confirmStockShortfall(negate(trackedQtyByCode(quote.items)), 'this invoice')) return;
   const { data: numData, error: numErr } = await supabaseClient.rpc('next_invoice_number');
   if (numErr) { alert(`Could not assign an invoice number — ${numErr.message}`); return; }
   const inv = JSON.parse(JSON.stringify(quote));
@@ -604,21 +725,26 @@ async function convertQuoteToInvoice(quote) {
   inv.dueDate = addDays(inv.issueDate, 30);
   inv.quoteRef = quote.number;
   inv.exportedToQBO = false;
-  inv.stockDeducted = false;
-
-  await adjustStockForInvoice(inv, -1);
+  // If the quote already took the stock, the hold moves to the invoice.
+  // Older quotes (saved before stock came off at quote stage), and quotes
+  // declined with parts returned to stock, hold nothing, so those deduct now.
+  const quoteHeldStock = !!quote.stockDeducted;
+  if (!quoteHeldStock) await adjustStockForDoc(inv, -1);
   inv.stockDeducted = true;
 
   const { data: insData, error: insErr } = await supabaseClient.from('documents').insert(mapDocToDb(inv)).select().single();
-  if (insErr) { alert(`Could not create the invoice — ${insErr.message}`); return; }
+  if (insErr) {
+    if (!quoteHeldStock) await adjustStockForDoc(inv, 1);
+    alert(`Could not create the invoice — ${insErr.message}`); return;
+  }
   inv.id = insData.id;
   inv.createdAt = insData.created_at;
   inv.updatedAt = insData.updated_at;
   STATE.counters.invoiceNum = numData;
 
-  const { error: updErr } = await supabaseClient.from('documents').update({ status: 'Converted' }).eq('id', quote.id);
-  if (updErr) { alert(`Invoice was created, but could not mark the quote as converted — ${updErr.message}`); }
-  else { quote.status = 'Converted'; quote.updatedAt = new Date().toISOString(); }
+  const { error: updErr } = await supabaseClient.from('documents').update({ status: 'Converted', stock_deducted: false }).eq('id', quote.id);
+  if (updErr) { alert(`Invoice was created, but could not mark the quote as converted — ${updErr.message}. Please check this quote before deleting or declining it.`); }
+  else { quote.status = 'Converted'; quote.stockDeducted = false; quote.updatedAt = new Date().toISOString(); }
 
   STATE.documents.unshift(inv);
   loadDocIntoBuilder(inv);
@@ -679,6 +805,7 @@ function renderCustomerSummary(c, customerNum) {
                 <button class="btn ghost small" data-act="view" data-id="${d.id}">View</button>
                 <button class="btn ghost small" data-act="edit" data-id="${d.id}">Edit</button>
                 ${d.type === 'quote' && d.status !== 'Converted' ? `<button class="btn accent small" data-act="convert" data-id="${d.id}">Convert to Invoice</button>` : ''}
+        ${d.type === 'quote' && d.status !== 'Converted' && d.status !== 'Declined' ? `<button class="btn ghost small" data-act="decline" data-id="${d.id}">Decline</button>` : ''}
                 ${d.type === 'invoice' && d.status !== 'Paid' ? `<button class="btn small" data-act="paid" data-id="${d.id}">Mark Paid</button>` : ''}
                 <button class="btn danger small" data-act="delete" data-id="${d.id}">Delete</button>
               </td>
@@ -730,6 +857,7 @@ function renderCustomerSummary(c, customerNum) {
       if (btn.dataset.act === 'view') { openPrintPreview(doc); }
       if (btn.dataset.act === 'edit') { loadDocIntoBuilder(doc); }
       if (btn.dataset.act === 'convert') { await convertQuoteToInvoice(doc); }
+      if (btn.dataset.act === 'decline') { if (await declineQuote(doc)) renderCustomerSummary(c, customerNum); }
       if (btn.dataset.act === 'paid') {
         doc.status = 'Paid'; doc.updatedAt = new Date().toISOString();
         const { error } = await supabaseClient.from('documents').update({ status: 'Paid', updated_at: doc.updatedAt }).eq('id', id);
@@ -740,7 +868,7 @@ function renderCustomerSummary(c, customerNum) {
         if (confirm(`Delete ${doc.number}? This cannot be undone.`)) {
           const { error } = await supabaseClient.from('documents').delete().eq('id', id);
           if (error) { alert('Could not delete — ' + error.message); return; }
-          if (doc.type === 'invoice' && doc.stockDeducted) await adjustStockForInvoice(doc, 1);
+          if (doc.stockDeducted && doc.status !== 'Declined') await adjustStockForDoc(doc, 1);
           STATE.documents = STATE.documents.filter(x => x.id !== id);
           renderCustomerSummary(c, customerNum);
         }
@@ -1071,6 +1199,7 @@ async function saveDocument(type, preview) {
   const isNewDoc = existingIdx === -1;
 
   if (isNewDoc) {
+    if (!d.stockDeducted && !confirmStockShortfall(negate(trackedQtyByCode(d.items)), `this ${type}`)) return;
     if (!d.number) {
       const rpcName = type === 'quote' ? 'next_quote_number' : 'next_invoice_number';
       const { data: numData, error: numErr } = await supabaseClient.rpc(rpcName);
@@ -1079,20 +1208,30 @@ async function saveDocument(type, preview) {
       STATE.counters[type === 'quote' ? 'quoteNum' : 'invoiceNum'] = numData;
     }
     d.status = d.status || 'Draft';
-    if (type === 'invoice' && !d.stockDeducted) {
-      await adjustStockForInvoice(d, -1);
+    let deductedNow = false;
+    if (!d.stockDeducted) {
+      await adjustStockForDoc(d, -1);
       d.stockDeducted = true;
+      deductedNow = true;
     }
     const { data: insData, error: insErr } = await supabaseClient.from('documents').insert(mapDocToDb(d)).select().single();
-    if (insErr) { alert(`Could not save this ${type} — ${insErr.message}`); return; }
+    if (insErr) {
+      if (deductedNow) { await adjustStockForDoc(d, 1); d.stockDeducted = false; }
+      alert(`Could not save this ${type} — ${insErr.message}`); return;
+    }
     d.id = insData.id;
     d.createdAt = insData.created_at;
     d.updatedAt = insData.updated_at;
     STATE.documents.unshift(d);
   } else {
     d.updatedAt = new Date().toISOString();
+    const original = STATE.documents[existingIdx];
+    if (original.stockDeducted && d.stockDeducted && !confirmStockShortfall(editDeltas(original, d), `this ${type}`)) return;
     const { error: updErr } = await supabaseClient.from('documents').update(mapDocToDb(d)).eq('id', d.id);
     if (updErr) { alert(`Could not save this ${type} — ${updErr.message}`); return; }
+    // Only documents currently holding stock adjust on edit (not declined,
+    // converted, or older quotes that never took stock).
+    if (original.stockDeducted && d.stockDeducted) await adjustStockForEdit(original, d);
     STATE.documents[existingIdx] = d;
   }
 
@@ -1488,7 +1627,7 @@ async function openStockHistoryModal(code) {
   const item = STATE.items.find(x => x.code === code);
   if (!item) return;
   const { data, error } = await supabaseClient.from('stock_movements').select('*').eq('item_code', code).order('created_at', { ascending: false });
-  const typeLabel = { initial_count: 'Initial count', correction: 'Correction', receipt: 'Stock receipt', invoice_deduct: 'Invoice', invoice_restore: 'Invoice deleted' };
+  const typeLabel = { initial_count: 'Initial count', correction: 'Correction', receipt: 'Stock receipt', invoice_deduct: 'Invoice', invoice_restore: 'Invoice deleted', invoice_edit: 'Invoice edited', quote_deduct: 'Quote', quote_restore: 'Quote declined/deleted (returned)', quote_edit: 'Quote edited', quote_used: 'Quote declined (parts used)' };
   const rows = error
     ? `<tr><td colspan="7" style="color:var(--danger);">Could not load history — ${esc(error.message)}</td></tr>`
     : (data && data.length ? data.map(m => `
