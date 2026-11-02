@@ -229,6 +229,12 @@ const supabaseClient = (window.supabase && typeof window.supabase.createClient =
   ? window.supabase.createClient(window.__SUPABASE_URL__, window.__SUPABASE_ANON_KEY__)
   : null;
 let CURRENT_USER = null; // { id, email }
+// Role from the user_roles table. 'no_stock' users can quote/invoice and add
+// non-stock items, but cannot set, correct or receive stock, or edit/set
+// stock codes on stock items. The database enforces this too; hiding the
+// buttons here just keeps the screens clean.
+let CURRENT_ROLE = 'full';
+function canManageStock() { return CURRENT_ROLE !== 'no_stock'; }
 
 let STATE = {
   customers: [],
@@ -324,6 +330,12 @@ async function loadAll() {
     ? { customerNum: counterRes.data.customer_num, itemCode: counterRes.data.item_code, quoteNum: counterRes.data.quote_num, invoiceNum: counterRes.data.invoice_num }
     : { customerNum: 0, itemCode: 0, quoteNum: 1, invoiceNum: 1 };
   STATE.company = companyRes.data ? mapCompanyFromDb(companyRes.data) : DEFAULT_COMPANY;
+  CURRENT_ROLE = 'full';
+  if (CURRENT_USER) {
+    const { data: roleRow } = await supabaseClient.from('user_roles').select('role').eq('user_id', CURRENT_USER.id).maybeSingle();
+    if (roleRow && roleRow.role) CURRENT_ROLE = roleRow.role;
+  }
+  if (!canManageStock() && CURRENT_TAB === 'receipts') CURRENT_TAB = 'dashboard';
   STATE.loaded = true;
   return true;
 }
@@ -567,7 +579,7 @@ let VIEW_CUSTOMER_NUM = null;
 
 function renderNav() {
   const nav = document.getElementById('tabsNav');
-  nav.innerHTML = TABS.map(t =>
+  nav.innerHTML = TABS.filter(t => t.id !== 'receipts' || canManageStock()).map(t =>
     `<button data-tab="${t.id}" class="${CURRENT_TAB === t.id ? 'active' : ''}">${t.label}</button>`
   ).join('');
   nav.querySelectorAll('button').forEach(b => {
@@ -594,7 +606,7 @@ function renderContent() {
     case 'newinvoice': return renderDocBuilder(c, 'invoice');
     case 'customers': return renderCustomers(c);
     case 'items': return renderItems(c);
-    case 'receipts': return renderStockReceipts(c);
+    case 'receipts': return canManageStock() ? renderStockReceipts(c) : renderDashboard(c);
     case 'assets': return renderAssets(c);
     case 'settings': return renderSettings(c);
     case 'export': return renderExport(c);
@@ -1532,18 +1544,23 @@ function itemsTabRowsHtml() {
   });
   const rows = filtered.slice(0, 200).map(x => {
     const isLow = isLowStock(x);
-    const stockCell = x.stockQty === null
+    const stockCell = !canManageStock()
+      ? (x.stockQty === null
+          ? `<span style="color:var(--steel);">Not tracked</span>`
+          : `<b>${x.stockQty}</b> <button class="btn ghost small stock-history-btn" data-code="${esc(x.code)}" style="margin-left:6px;">History</button>`)
+      : x.stockQty === null
       ? `<input type="number" class="stock-initial-input" min="0" placeholder="Not set" style="width:80px;">
          <button class="btn ghost small stock-set-btn" data-code="${esc(x.code)}">Set</button>`
       : `<b>${x.stockQty}</b>
          <button class="btn ghost small stock-correct-btn" data-code="${esc(x.code)}" style="margin-left:6px;">Correct</button>
          <button class="btn ghost small stock-history-btn" data-code="${esc(x.code)}">History</button>`;
+    const canEditItem = canManageStock() || x.stockQty === null;
     return `
     <tr style="${isLow ? 'background:#fef2f2;' : ''}">
       <td data-label="Code">${esc(x.code)}</td>
       <td data-label="Stock Code">${x.stockCode ? esc(x.stockCode) : '<span style="color:var(--steel);">—</span>'}</td>
       <td data-label="Description">${esc(x.desc)}${x.isNew ? '<span class="badge-new">NEW</span>':''}${isLow ? ' <span class="pill overdue">Reorder</span>' : ''}
-        <button class="btn ghost small item-edit-btn" data-code="${esc(x.code)}" style="margin-left:6px;">Edit</button>
+        ${canEditItem ? `<button class="btn ghost small item-edit-btn" data-code="${esc(x.code)}" style="margin-left:6px;">Edit</button>` : ''}
       </td>
       <td data-label="Price">R ${fmtMoney(x.price)}</td>
       <td data-label="VAT">${x.vat}</td>
@@ -1561,7 +1578,7 @@ function openEditItemModal(code) {
       <div style="max-width:420px;width:100%;background:#fff;border-radius:8px;overflow:hidden;">
         <div style="padding:12px 20px;background:var(--ink);color:#fff;"><b>Edit Item — ${esc(item.code)}</b></div>
         <div style="padding:20px;">
-          <div class="field"><label>Stock Code</label><input type="text" id="ieStockCode" value="${esc(item.stockCode || '')}" placeholder="e.g. your shelf/stock code"></div>
+          ${canManageStock() ? `<div class="field"><label>Stock Code</label><input type="text" id="ieStockCode" value="${esc(item.stockCode || '')}" placeholder="e.g. your shelf/stock code"></div>` : ''}
           <div class="field"><label>Description</label><input type="text" id="ieDesc" value="${esc(item.desc)}"></div>
           <div class="field"><label>Price (R)</label><input type="number" step="0.01" id="iePrice" value="${item.price}"></div>
           <div class="field"><label>VAT</label>
@@ -1584,7 +1601,8 @@ function openEditItemModal(code) {
     if (!newDesc) { alert('Description is required.'); return; }
     const newPrice = Number(document.getElementById('iePrice').value) || 0;
     const newVat = document.getElementById('ieVat').value;
-    const newStockCode = document.getElementById('ieStockCode').value.trim();
+    const scInput = document.getElementById('ieStockCode');
+    const newStockCode = scInput ? scInput.value.trim() : (item.stockCode || '');
     const clash = stockCodeTakenBy(newStockCode, code);
     if (clash) { alert(`Stock code ${newStockCode} is already used by "${clash.desc}" (${clash.code}).`); return; }
     if (newDesc !== item.desc) {
@@ -1738,16 +1756,16 @@ function renderItems(c) {
     box.innerHTML = `
       <div class="card" style="background:var(--paper);">
         <div class="row">
-          <div class="col"><div class="field"><label>Stock Code</label><input type="text" id="tiStockCode" placeholder="Optional"></div></div>
+          ${canManageStock() ? `<div class="col"><div class="field"><label>Stock Code</label><input type="text" id="tiStockCode" placeholder="Optional"></div></div>` : ''}
           <div class="col"><div class="field"><label>Description *</label><input type="text" id="tiDesc"></div></div>
           <div class="col"><div class="field"><label>Price (R)</label><input type="number" step="0.01" id="tiPrice"></div></div>
           <div class="col"><div class="field"><label>VAT</label>
             <select id="tiVat"><option value="15% VAT">Standard (15%)</option><option value="VAT Free">Zero-rated</option></select>
           </div></div>
         </div>
-        <div class="row">
+        ${canManageStock() ? `<div class="row">
           <div class="col"><div class="field"><label>Starting Stock Qty (optional)</label><input type="number" id="tiStock" placeholder="Leave blank to not track"></div></div>
-        </div>
+        </div>` : `<p class="note">You can add non-stock items here (labour, consumables, fees). Stock items are set up by the stock controller.</p>`}
         <button class="btn accent small" id="tiSaveBtn">Save Item</button>
         <button class="btn ghost small" id="tiCancelBtn">Cancel</button>
       </div>
@@ -1756,10 +1774,12 @@ function renderItems(c) {
     document.getElementById('tiSaveBtn').onclick = async () => {
       const desc = document.getElementById('tiDesc').value.trim();
       if (!desc) { alert('Item description is required.'); return; }
-      const newStockCode = document.getElementById('tiStockCode').value.trim();
+      const tiSc = document.getElementById('tiStockCode');
+      const newStockCode = tiSc ? tiSc.value.trim() : '';
       const clash = stockCodeTakenBy(newStockCode, null);
       if (clash) { alert(`Stock code ${newStockCode} is already used by "${clash.desc}" (${clash.code}).`); return; }
-      const stockRaw = document.getElementById('tiStock').value.trim();
+      const tiStockEl = document.getElementById('tiStock');
+      const stockRaw = tiStockEl ? tiStockEl.value.trim() : '';
       const item = await createItemRecord({
         stockCode: newStockCode,
         desc, price: Number(document.getElementById('tiPrice').value) || 0,
