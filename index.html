@@ -267,11 +267,11 @@ function mapCustomerToDb(c) {
     disabled: !!c.disabled, is_new: !!c.isNew, exported_to_qbo: !!c.exportedToQBO };
 }
 function mapItemFromDb(r) {
-  return { code: r.code, desc: r.description, price: Number(r.price) || 0, vat: r.vat, isNew: r.is_new,
+  return { code: r.code, stockCode: r.stock_code || '', desc: r.description, price: Number(r.price) || 0, vat: r.vat, isNew: r.is_new,
     stockQty: (r.stock_qty === null || r.stock_qty === undefined) ? null : Number(r.stock_qty) };
 }
 function mapItemToDb(it) {
-  return { code: it.code, description: it.desc, price: Number(it.price) || 0, vat: it.vat, is_new: !!it.isNew,
+  return { code: it.code, stock_code: (it.stockCode || '').trim() || null, description: it.desc, price: Number(it.price) || 0, vat: it.vat, is_new: !!it.isNew,
     stock_qty: (it.stockQty === null || it.stockQty === undefined || it.stockQty === '') ? null : Number(it.stockQty) };
 }
 function mapDocFromDb(r) {
@@ -1033,12 +1033,12 @@ function attachItemAutocomplete(inputEl, resultsBox, idx, matchType) {
     const q = query.toLowerCase().trim();
     const matches = q.length < 1
       ? STATE.items.slice(0, 20)
-      : STATE.items.filter(it => matchType === 'code' ? it.code.toLowerCase().includes(q) : it.desc.toLowerCase().includes(q)).slice(0, 20);
+      : STATE.items.filter(it => matchType === 'code' ? (it.code.toLowerCase().includes(q) || (it.stockCode || '').toLowerCase().includes(q)) : it.desc.toLowerCase().includes(q)).slice(0, 20);
     if (!matches.length) { resultsBox.innerHTML = '<div style="color:var(--steel);">No matching items</div>'; resultsBox.style.display = 'block'; return; }
     const hint = (q.length < 1 && STATE.items.length > matches.length)
       ? `<div style="color:var(--steel);font-style:italic;cursor:default;">Showing ${matches.length} of ${STATE.items.length} — type to search</div>`
       : '';
-    resultsBox.innerHTML = hint + matches.map(m => `<div data-code="${esc(m.code)}"><b>${esc(matchType==='code' ? m.code : m.desc)}</b><div class="meta">${esc(matchType==='code' ? m.desc : m.code)} · R ${fmtMoney(m.price)} · ${m.vat==='VAT Free'?'Zero-rated':'Standard'}</div></div>`).join('');
+    resultsBox.innerHTML = hint + matches.map(m => `<div data-code="${esc(m.code)}"><b>${esc(matchType==='code' ? m.code : m.desc)}</b><div class="meta">${esc(matchType==='code' ? m.desc : m.code)}${m.stockCode ? ' · Stock code ' + esc(m.stockCode) : ''} · R ${fmtMoney(m.price)} · ${m.vat==='VAT Free'?'Zero-rated':'Standard'}</div></div>`).join('');
     resultsBox.style.display = 'block';
     resultsBox.querySelectorAll('div[data-code]').forEach(opt => {
       // mousedown fires before blur, so selection registers even though the
@@ -1518,13 +1518,21 @@ function renderCustomers(c) {
 /* ===================== Items tab ===================== */
 let itemSearchTab = '';
 let itemLowStockOnly = false;
+function stockCodeTakenBy(stockCode, exceptCode) {
+  const sc = (stockCode || '').trim().toLowerCase();
+  if (!sc) return null;
+  return STATE.items.find(x => x.code !== exceptCode && (x.stockCode || '').trim().toLowerCase() === sc) || null;
+}
+function itemMatches(x, q) {
+  return x.desc.toLowerCase().includes(q) || x.code.toLowerCase().includes(q) || (x.stockCode || '').toLowerCase().includes(q);
+}
 function isLowStock(x) {
   return x.stockQty !== null && x.stockQty < STATE.company.reorderThreshold;
 }
 function itemsTabRowsHtml() {
   const filtered = STATE.items.filter(x => {
     if (itemLowStockOnly && !isLowStock(x)) return false;
-    return !itemSearchTab || x.desc.toLowerCase().includes(itemSearchTab.toLowerCase()) || x.code.toLowerCase().includes(itemSearchTab.toLowerCase());
+    return !itemSearchTab || itemMatches(x, itemSearchTab.toLowerCase());
   });
   const rows = filtered.slice(0, 200).map(x => {
     const isLow = isLowStock(x);
@@ -1537,6 +1545,7 @@ function itemsTabRowsHtml() {
     return `
     <tr style="${isLow ? 'background:#fef2f2;' : ''}">
       <td data-label="Code">${esc(x.code)}</td>
+      <td data-label="Stock Code">${x.stockCode ? esc(x.stockCode) : '<span style="color:var(--steel);">—</span>'}</td>
       <td data-label="Description">${esc(x.desc)}${x.isNew ? '<span class="badge-new">NEW</span>':''}${isLow ? ' <span class="pill overdue">Reorder</span>' : ''}
         <button class="btn ghost small item-edit-btn" data-code="${esc(x.code)}" style="margin-left:6px;">Edit</button>
       </td>
@@ -1556,6 +1565,7 @@ function openEditItemModal(code) {
       <div style="max-width:420px;width:100%;background:#fff;border-radius:8px;overflow:hidden;">
         <div style="padding:12px 20px;background:var(--ink);color:#fff;"><b>Edit Item — ${esc(item.code)}</b></div>
         <div style="padding:20px;">
+          <div class="field"><label>Stock Code</label><input type="text" id="ieStockCode" value="${esc(item.stockCode || '')}" placeholder="e.g. your shelf/stock code"></div>
           <div class="field"><label>Description</label><input type="text" id="ieDesc" value="${esc(item.desc)}"></div>
           <div class="field"><label>Price (R)</label><input type="number" step="0.01" id="iePrice" value="${item.price}"></div>
           <div class="field"><label>VAT</label>
@@ -1578,6 +1588,9 @@ function openEditItemModal(code) {
     if (!newDesc) { alert('Description is required.'); return; }
     const newPrice = Number(document.getElementById('iePrice').value) || 0;
     const newVat = document.getElementById('ieVat').value;
+    const newStockCode = document.getElementById('ieStockCode').value.trim();
+    const clash = stockCodeTakenBy(newStockCode, code);
+    if (clash) { alert(`Stock code ${newStockCode} is already used by "${clash.desc}" (${clash.code}).`); return; }
     if (newDesc !== item.desc) {
       const stockNote = item.stockQty === null ? 'not tracked' : `currently ${item.stockQty}`;
       const ok = confirm(
@@ -1589,9 +1602,9 @@ function openEditItemModal(code) {
       );
       if (!ok) return;
     }
-    const { error } = await supabaseClient.from('items').update({ description: newDesc, price: newPrice, vat: newVat }).eq('code', code);
-    if (error) { alert('Could not save changes — ' + error.message); return; }
-    item.desc = newDesc; item.price = newPrice; item.vat = newVat;
+    const { error } = await supabaseClient.from('items').update({ description: newDesc, price: newPrice, vat: newVat, stock_code: newStockCode || null }).eq('code', code);
+    if (error) { alert(/duplicate|unique/i.test(error.message) ? `Stock code ${newStockCode} is already in use on another item.` : 'Could not save changes — ' + error.message); return; }
+    item.desc = newDesc; item.price = newPrice; item.vat = newVat; item.stockCode = newStockCode;
     document.getElementById('itemEditModal').remove();
     refreshItemsTabBody();
   };
@@ -1714,7 +1727,7 @@ function renderItems(c) {
       <button class="btn accent small" id="addItemTabBtn" style="margin-bottom:12px;">+ Add Item</button>
       <div id="itemTabForm"></div>
       <table class="data">
-        <thead><tr><th>Code</th><th>Description</th><th>Price</th><th>VAT</th><th>Stock Qty</th></tr></thead>
+        <thead><tr><th>Code</th><th>Stock Code</th><th>Description</th><th>Price</th><th>VAT</th><th>Stock Qty</th></tr></thead>
         <tbody id="itemTabTbody">${rows}</tbody>
       </table>
       <div id="itemTabMore">${more}</div>
@@ -1729,6 +1742,7 @@ function renderItems(c) {
     box.innerHTML = `
       <div class="card" style="background:var(--paper);">
         <div class="row">
+          <div class="col"><div class="field"><label>Stock Code</label><input type="text" id="tiStockCode" placeholder="Optional"></div></div>
           <div class="col"><div class="field"><label>Description *</label><input type="text" id="tiDesc"></div></div>
           <div class="col"><div class="field"><label>Price (R)</label><input type="number" step="0.01" id="tiPrice"></div></div>
           <div class="col"><div class="field"><label>VAT</label>
@@ -1746,8 +1760,12 @@ function renderItems(c) {
     document.getElementById('tiSaveBtn').onclick = async () => {
       const desc = document.getElementById('tiDesc').value.trim();
       if (!desc) { alert('Item description is required.'); return; }
+      const newStockCode = document.getElementById('tiStockCode').value.trim();
+      const clash = stockCodeTakenBy(newStockCode, null);
+      if (clash) { alert(`Stock code ${newStockCode} is already used by "${clash.desc}" (${clash.code}).`); return; }
       const stockRaw = document.getElementById('tiStock').value.trim();
       const item = await createItemRecord({
+        stockCode: newStockCode,
         desc, price: Number(document.getElementById('tiPrice').value) || 0,
         vat: document.getElementById('tiVat').value,
         stockQty: stockRaw === '' ? null : (Number(stockRaw) || 0),
@@ -1858,7 +1876,7 @@ function renderReceiptItemsRows() {
     function showTrackedMatches(query) {
       const q = query.toLowerCase().trim();
       const trackedItems = STATE.items.filter(x => x.stockQty !== null);
-      const matches = q.length < 1 ? trackedItems.slice(0, 20) : trackedItems.filter(x => x.desc.toLowerCase().includes(q) || x.code.toLowerCase().includes(q)).slice(0, 20);
+      const matches = q.length < 1 ? trackedItems.slice(0, 20) : trackedItems.filter(x => itemMatches(x, q)).slice(0, 20);
       if (!matches.length) { resultsBox.innerHTML = '<div style="color:var(--steel);">No tracked items match</div>'; resultsBox.style.display = 'block'; return; }
       resultsBox.innerHTML = matches.map(m => `<div data-code="${esc(m.code)}"><b>${esc(m.desc)}</b><div class="meta">${m.code} · current stock ${m.stockQty}</div></div>`).join('');
       resultsBox.style.display = 'block';
