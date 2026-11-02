@@ -240,6 +240,16 @@ let CURRENT_USER = null; // { id, email }
 let CURRENT_ROLE = 'full';
 function canManageStock() { return CURRENT_ROLE !== 'no_stock'; }
 function canExportQBO() { return CURRENT_ROLE !== 'no_stock'; }
+// Roles limited to specific tabs. stock_controller only works with stock:
+// Items, Stock Receipts and Assets (full edit there), nothing else.
+const ROLE_TABS = { stock_controller: ['items', 'receipts', 'assets'] };
+function tabAllowed(id) {
+  if (ROLE_TABS[CURRENT_ROLE]) return ROLE_TABS[CURRENT_ROLE].includes(id);
+  if (id === 'receipts') return canManageStock();
+  if (id === 'export') return canExportQBO();
+  return true;
+}
+function homeTab() { return ROLE_TABS[CURRENT_ROLE] ? ROLE_TABS[CURRENT_ROLE][0] : 'dashboard'; }
 
 let STATE = {
   customers: [],
@@ -340,7 +350,7 @@ async function loadAll() {
     const { data: roleRow } = await supabaseClient.from('user_roles').select('role').eq('user_id', CURRENT_USER.id).maybeSingle();
     if (roleRow && roleRow.role) CURRENT_ROLE = roleRow.role;
   }
-  if ((!canManageStock() && CURRENT_TAB === 'receipts') || (!canExportQBO() && CURRENT_TAB === 'export')) CURRENT_TAB = 'dashboard';
+  if (!tabAllowed(CURRENT_TAB)) CURRENT_TAB = homeTab();
   STATE.loaded = true;
   return true;
 }
@@ -584,7 +594,7 @@ let VIEW_CUSTOMER_NUM = null;
 
 function renderNav() {
   const nav = document.getElementById('tabsNav');
-  nav.innerHTML = TABS.filter(t => (t.id !== 'receipts' || canManageStock()) && (t.id !== 'export' || canExportQBO())).map(t =>
+  nav.innerHTML = TABS.filter(t => tabAllowed(t.id)).map(t =>
     `<button data-tab="${t.id}" class="${CURRENT_TAB === t.id ? 'active' : ''}">${t.label}</button>`
   ).join('');
   nav.querySelectorAll('button').forEach(b => {
@@ -605,6 +615,7 @@ function renderNav() {
 function renderContent() {
   const c = document.getElementById('content');
   if (!STATE.loaded) { c.innerHTML = '<p>Loading…</p>'; return; }
+  if (!tabAllowed(CURRENT_TAB)) { CURRENT_TAB = homeTab(); renderNav(); }
   switch (CURRENT_TAB) {
     case 'dashboard': return renderDashboard(c);
     case 'newquote': return renderDocBuilder(c, 'quote');
