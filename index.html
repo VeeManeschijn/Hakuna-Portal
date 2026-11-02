@@ -337,14 +337,40 @@ function showLoadError(msg) {
 }
 
 /* ---------- Shared create/update/delete helpers ---------- */
-async function createCustomerRecord(fields) {
-  const { data: numData, error: numErr } = await supabaseClient.rpc('next_customer_number');
-  if (numErr) { alert('Could not assign a customer number — ' + numErr.message); return null; }
-  const cust = { num: String(numData), chargeVat: true, disabled: false, isNew: true, exportedToQBO: false, ...fields };
+// manualNum: an existing customer number from the old system. Leave blank
+// to auto-generate the next number. Auto-generated numbers skip any number
+// that was already typed in manually, so the two can never clash.
+function customerNumTaken(num) {
+  const n = String(num).trim().toLowerCase();
+  return STATE.customers.some(c => String(c.num).trim().toLowerCase() === n);
+}
+async function createCustomerRecord(fields, manualNum) {
+  let num;
+  manualNum = (manualNum || '').trim();
+  if (manualNum) {
+    if (customerNumTaken(manualNum)) {
+      const other = STATE.customers.find(c => String(c.num).trim().toLowerCase() === manualNum.toLowerCase());
+      alert(`Customer number ${manualNum} is already used by ${other ? other.name : 'another customer'}. Use a different number, or leave it blank to auto-generate.`);
+      return null;
+    }
+    num = manualNum;
+  } else {
+    for (let tries = 0; tries < 100 && !num; tries++) {
+      const { data: numData, error: numErr } = await supabaseClient.rpc('next_customer_number');
+      if (numErr) { alert('Could not assign a customer number — ' + numErr.message); return null; }
+      STATE.counters.customerNum = numData;
+      if (!customerNumTaken(numData)) num = String(numData);
+    }
+    if (!num) { alert('Could not find a free customer number — please type one in.'); return null; }
+  }
+  const cust = { num, chargeVat: true, disabled: false, isNew: true, exportedToQBO: false, ...fields };
   const { error: insErr } = await supabaseClient.from('customers').insert(mapCustomerToDb(cust));
-  if (insErr) { alert('Could not save this customer — ' + insErr.message); return null; }
+  if (insErr) {
+    const dup = /duplicate|unique/i.test(insErr.message);
+    alert(dup ? `Customer number ${num} is already in use (someone may have just added it). Please try again.` : 'Could not save this customer — ' + insErr.message);
+    return null;
+  }
   STATE.customers.push(cust);
-  STATE.counters.customerNum = numData;
   return cust;
 }
 async function createItemRecord(fields) {
@@ -1148,6 +1174,7 @@ function renderInlineCustomerForm() {
   box.innerHTML = `
     <div class="card" style="margin-top:10px;background:var(--paper);">
       <div class="row">
+        <div class="col"><div class="field"><label>Customer No.</label><input type="text" id="ncNum" placeholder="Leave blank to auto-generate"></div></div>
         <div class="col"><div class="field"><label>Name *</label><input type="text" id="ncName"></div></div>
         <div class="col"><div class="field"><label>Contact person</label><input type="text" id="ncContact"></div></div>
       </div>
@@ -1165,6 +1192,7 @@ function renderInlineCustomerForm() {
         <div class="col"><div class="field"><label>Company registration number</label><input type="text" id="ncReg"></div></div>
         <div class="col"><div class="field"><label>Payment terms (days)</label><input type="number" id="ncTerms" value="30"></div></div>
       </div>
+      <p class="note" style="margin-top:-4px;">Customer No.: type the number from the old system for an existing customer. For a brand-new customer, leave it blank and the next number is assigned automatically.</p>
       <button class="btn accent small" id="ncSaveBtn">Save Customer</button>
       <button class="btn ghost small" id="ncCancelBtn">Cancel</button>
     </div>
@@ -1184,7 +1212,7 @@ function renderInlineCustomerForm() {
       vat: document.getElementById('ncVat').value.trim(),
       reg: document.getElementById('ncReg').value.trim(),
       terms: document.getElementById('ncTerms').value.trim(),
-    });
+    }, document.getElementById('ncNum').value);
     if (!cust) return;
     CURRENT_DRAFT.customer = cust;
     renderContent();
@@ -1439,6 +1467,7 @@ function renderCustomers(c) {
     box.innerHTML = `
       <div class="card" style="background:var(--paper);">
         <div class="row">
+          <div class="col"><div class="field"><label>Customer No.</label><input type="text" id="tcNum" placeholder="Leave blank to auto-generate"></div></div>
           <div class="col"><div class="field"><label>Name *</label><input type="text" id="tcName"></div></div>
           <div class="col"><div class="field"><label>Contact person</label><input type="text" id="tcContact"></div></div>
         </div>
@@ -1456,6 +1485,7 @@ function renderCustomers(c) {
           <div class="col"><div class="field"><label>Company registration number</label><input type="text" id="tcReg"></div></div>
           <div class="col"><div class="field"><label>Payment terms (days)</label><input type="number" id="tcTerms" value="30"></div></div>
         </div>
+        <p class="note" style="margin-top:-4px;">Customer No.: type the number from the old system for an existing customer. For a brand-new customer, leave it blank and the next number is assigned automatically.</p>
         <button class="btn accent small" id="tcSaveBtn">Save Customer</button>
         <button class="btn ghost small" id="tcCancelBtn">Cancel</button>
       </div>
@@ -1475,7 +1505,7 @@ function renderCustomers(c) {
         vat: document.getElementById('tcVat').value.trim(),
         reg: document.getElementById('tcReg').value.trim(),
         terms: document.getElementById('tcTerms').value.trim(),
-      });
+      }, document.getElementById('tcNum').value);
       if (!cust) return;
       VIEW_CUSTOMER_NUM = cust.num;
       CURRENT_TAB = 'customerSummary';
