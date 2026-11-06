@@ -2742,6 +2742,77 @@ function stopLiveUpdates() {
   if (LIVE_CHANNEL) { try { supabaseClient.removeChannel(LIVE_CHANNEL); } catch (e) {} LIVE_CHANNEL = null; }
 }
 
+/* ===================== Sign out after 15 minutes without activity ===================== */
+// Activity is shared between tabs in the same browser, so working in one tab
+// keeps the others signed in. A warning shows for the last minute, so nobody
+// loses a half-finished quote without notice.
+const IDLE_LIMIT_MS = 15 * 60 * 1000;
+const IDLE_WARN_MS = 60 * 1000;
+const IDLE_KEY = 'hakuna_last_activity';
+let IDLE_INTERVAL = null;
+let IDLE_LAST = Date.now();
+let IDLE_LAST_SAVED = 0;
+function idleStoredLast() { try { return Number(localStorage.getItem(IDLE_KEY)) || 0; } catch (e) { return 0; } }
+function idleLast() { return Math.max(IDLE_LAST, idleStoredLast()); }
+function idleMarkActive() {
+  IDLE_LAST = Date.now();
+  if (IDLE_LAST - IDLE_LAST_SAVED > 5000) {
+    IDLE_LAST_SAVED = IDLE_LAST;
+    try { localStorage.setItem(IDLE_KEY, String(IDLE_LAST)); } catch (e) {}
+  }
+  const w = document.getElementById('idleWarning');
+  if (w) w.remove();
+}
+function showIdleWarning(secondsLeft) {
+  let w = document.getElementById('idleWarning');
+  if (!w) {
+    w = document.createElement('div');
+    w.id = 'idleWarning';
+    w.className = 'no-print';
+    w.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:300;display:flex;align-items:center;justify-content:center;padding:20px;';
+    w.innerHTML = `<div style="max-width:420px;width:100%;background:#fff;border-radius:8px;overflow:hidden;">
+        <div style="padding:12px 20px;background:var(--ink);color:#fff;"><b>Still there?</b></div>
+        <div style="padding:20px;">
+          <p style="margin-top:0;">You'll be signed out in <b class="idle-secs"></b> seconds because there's been no activity for almost 15 minutes.</p>
+          <p class="note">Anything you haven't saved will be lost.</p>
+          <button class="btn accent small" id="idleStayBtn">Stay signed in</button>
+        </div></div>`;
+    document.body.appendChild(w);
+    document.getElementById('idleStayBtn').onclick = () => idleMarkActive();
+  }
+  w.querySelector('.idle-secs').textContent = Math.max(0, secondsLeft);
+}
+function idleCheck() {
+  if (!CURRENT_USER) return;
+  const idle = Date.now() - idleLast();
+  if (idle >= IDLE_LIMIT_MS) { idleSignOut(); return; }
+  if (idle >= IDLE_LIMIT_MS - IDLE_WARN_MS) showIdleWarning(Math.ceil((IDLE_LIMIT_MS - idle) / 1000));
+  else { const w = document.getElementById('idleWarning'); if (w) w.remove(); }
+}
+function startIdleWatch() {
+  // Reopening the app after more than 15 minutes away needs a fresh sign-in.
+  const prev = idleStoredLast();
+  if (prev && Date.now() - prev >= IDLE_LIMIT_MS) { idleSignOut(); return false; }
+  idleMarkActive();
+  if (IDLE_INTERVAL) return true;
+  ['mousemove', 'mousedown', 'keydown', 'scroll', 'touchstart', 'wheel'].forEach(ev =>
+    document.addEventListener(ev, () => { if (CURRENT_USER) idleMarkActive(); }, { passive: true, capture: true }));
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) idleCheck(); });
+  window.addEventListener('storage', e => {
+    // Another tab in this browser signed out: follow it.
+    if (e.key === 'hakuna_signed_out' && CURRENT_USER) idleSignOut(true);
+  });
+  IDLE_INTERVAL = setInterval(idleCheck, 1000);
+  return true;
+}
+async function idleSignOut(fromOtherTab) {
+  if (!CURRENT_USER) return;
+  if (!fromOtherTab) { try { localStorage.setItem('hakuna_signed_out', String(Date.now())); } catch (e) {} }
+  // 'local' signs out this browser only, not the same person's other computers.
+  await handleLogout('local');
+  showLoginScreen('You were signed out after 15 minutes without activity. Please sign in again.');
+}
+
 function showLoginScreen(errorMsg) {
   document.getElementById('appRoot').style.display = 'none';
   document.getElementById('loginScreen').style.display = 'flex';
@@ -2751,6 +2822,7 @@ function showLoginScreen(errorMsg) {
 }
 
 async function showApp() {
+  if (!startIdleWatch()) return;
   document.getElementById('loginScreen').style.display = 'none';
   document.getElementById('appRoot').style.display = 'block';
   document.getElementById('loggedInAs').textContent = CURRENT_USER ? CURRENT_USER.email : '';
@@ -2770,13 +2842,16 @@ async function handleLogin() {
   loginBtn.disabled = false; loginBtn.textContent = 'Sign In';
   if (error) { showLoginScreen(error.message); return; }
   CURRENT_USER = { id: data.user.id, email: data.user.email };
+  idleMarkActive();
+  try { localStorage.setItem(IDLE_KEY, String(Date.now())); } catch (e) {}
   await showApp();
 }
 
-async function handleLogout() {
+async function handleLogout(scope) {
   stopLiveUpdates();
-  await supabaseClient.auth.signOut();
   CURRENT_USER = null;
+  document.querySelectorAll('#previewModal, #declineModal, #disposeModal, #itemEditModal, #stockModal, #idleWarning').forEach(el => el.remove());
+  try { await supabaseClient.auth.signOut(scope === 'local' ? { scope: 'local' } : undefined); } catch (e) { console.error(e); }
   STATE.loaded = false;
   showLoginScreen();
 }
@@ -2802,7 +2877,7 @@ async function handleLogout() {
 
   document.getElementById('loginBtn').onclick = handleLogin;
   document.getElementById('loginPassword').addEventListener('keydown', (e) => { if (e.key === 'Enter') handleLogin(); });
-  document.getElementById('logoutBtn').onclick = handleLogout;
+  document.getElementById('logoutBtn').onclick = () => handleLogout();
 
   const { data: { session } } = await supabaseClient.auth.getSession();
   if (session && session.user) {
