@@ -97,6 +97,10 @@
   table.statement-items th:nth-child(5),table.statement-items td:nth-child(5){text-align:left;}
   table.statement-items th:nth-child(6),table.statement-items td:nth-child(6),table.statement-items th:nth-child(7),table.statement-items td:nth-child(7){text-align:right;}
   table.statement-ageing th{text-align:right!important;}
+  button.is-busy{opacity:.55;cursor:progress;}
+  body.app-busy{cursor:progress;}
+  .pill.approved{background:#dcfce7;color:#166534;}
+  .pill.awaiting{background:#fef3c7;color:#92400e;}
   .doc-totals{max-width:340px;margin-left:auto;font-size:13px;}
   .doc-totals .trow{display:flex;justify-content:space-between;padding:5px 8px;}
   .doc-totals .trow.total{font-weight:800;font-size:15px;border-top:2px solid var(--ink);color:var(--accent);}
@@ -242,6 +246,28 @@ let CURRENT_USER = null; // { id, email }
 // stock codes on stock items. The database enforces this too; hiding the
 // buttons here just keeps the screens clean.
 let CURRENT_ROLE = 'full';
+document.addEventListener('click', ev => {
+  const btn = ev.target && ev.target.closest ? ev.target.closest('button') : null;
+  if (!btn || typeof btn.onclick !== 'function') return;
+  ev.stopPropagation();
+  ev.preventDefault();
+  if (btn.dataset.busy === '1') return;
+  let result;
+  try { result = btn.onclick.call(btn, ev); } catch (e) { console.error(e); return; }
+  if (result && typeof result.then === 'function') {
+    btn.dataset.busy = '1';
+    btn.disabled = true;
+    btn.classList.add('is-busy');
+    document.body.classList.add('app-busy');
+    const done = () => {
+      btn.dataset.busy = '';
+      btn.disabled = false;
+      btn.classList.remove('is-busy');
+      if (!document.querySelector('button.is-busy')) document.body.classList.remove('app-busy');
+    };
+    result.then(done, err => { done(); console.error(err); });
+  }
+}, true);
 function canManageStock() { return CURRENT_ROLE !== 'no_stock'; }
 function canExportQBO() { return !['no_stock', 'no_export', 'stock_controller'].includes(CURRENT_ROLE); }
 // Roles limited to specific tabs. stock_controller only works with stock:
@@ -254,6 +280,28 @@ function tabAllowed(id) {
   return true;
 }
 function canSendStatements() { return !['no_stock', 'stock_controller'].includes(CURRENT_ROLE); }
+// Jacobus, Lizette and full-access users approve quotes and can delete items.
+function canApproveQuotes() { return !['no_stock', 'stock_controller'].includes(CURRENT_ROLE); }
+function canDeleteItems() { return !['no_stock', 'stock_controller'].includes(CURRENT_ROLE); }
+function quoteIsOpen(d) { return d && d.type === 'quote' && d.status !== 'Converted' && d.status !== 'Declined'; }
+function quoteNeedsApproval(d) { return quoteIsOpen(d) && !d.approvedAt; }
+function quoteBlockedForMe(d) { return quoteNeedsApproval(d) && !canApproveQuotes(); }
+function normDesc(t) { return String(t || '').trim().replace(/\s+/g, ' ').toLowerCase(); }
+function findDuplicateItem(desc, exceptCode) {
+  const k = normDesc(desc);
+  if (!k) return null;
+  return STATE.items.find(x => x.code !== exceptCode && normDesc(x.desc) === k) || null;
+}
+function duplicateItemMessage(dup) {
+  return `"${dup.desc}" already exists as ${dup.code}${dup.stockCode ? ' (stock code ' + dup.stockCode + ')' : ''}. Search for it in the Items list instead of adding it again.`;
+}
+// Put a row into a list, replacing any existing row with the same key
+// (live updates can deliver our own new rows before our save finishes).
+function putRow(list, key, row, atStart) {
+  const i = list.findIndex(x => x[key] === row[key]);
+  if (i !== -1) { list[i] = row; return; }
+  if (atStart) list.unshift(row); else list.push(row);
+}
 function homeTab() { return ROLE_TABS[CURRENT_ROLE] ? ROLE_TABS[CURRENT_ROLE][0] : 'dashboard'; }
 
 let STATE = {
@@ -283,7 +331,7 @@ const DEFAULT_COMPANY = {
 
 /* ---------- DB row <-> app object mapping ---------- */
 function mapCustomerFromDb(r) {
-  return { num: r.num, name: r.name, contact: r.contact || '', email: r.email || '', phone: r.phone || '',
+  return { id: r.id, num: r.num, name: r.name, contact: r.contact || '', email: r.email || '', phone: r.phone || '',
     address: r.address || '', city: r.city || '', postCode: r.post_code || '', vat: r.vat || '', reg: r.reg || '',
     chargeVat: r.charge_vat, terms: r.terms || '', disabled: r.disabled, isNew: r.is_new, exportedToQBO: r.exported_to_qbo };
 }
@@ -293,7 +341,8 @@ function mapCustomerToDb(c) {
     disabled: !!c.disabled, is_new: !!c.isNew, exported_to_qbo: !!c.exportedToQBO };
 }
 function mapItemFromDb(r) {
-  return { code: r.code, stockCode: r.stock_code || '', desc: r.description, price: Number(r.price) || 0, vat: r.vat, isNew: r.is_new,
+  return { id: r.id, code: r.code, stockCode: r.stock_code || '', desc: r.description, price: Number(r.price) || 0, vat: r.vat, isNew: r.is_new,
+    archived: !!r.archived, createdAt: r.created_at || '',
     stockQty: (r.stock_qty === null || r.stock_qty === undefined) ? null : Number(r.stock_qty) };
 }
 function mapItemToDb(it) {
@@ -306,17 +355,25 @@ function mapDocFromDb(r) {
     poNumber: r.po_number || '', jobcard: r.jobcard || '', tec: r.tec || '', hkm: r.hkm || '', quoteRef: r.quote_ref || '',
     issueDate: r.issue_date || '', dueDate: r.due_date || '', items: r.items || [],
     subtotal: Number(r.subtotal) || 0, taxTotal: Number(r.tax_total) || 0, total: Number(r.total) || 0,
-    exportedToQBO: r.exported_to_qbo, stockDeducted: !!r.stock_deducted, createdAt: r.created_at, updatedAt: r.updated_at };
+    exportedToQBO: r.exported_to_qbo, stockDeducted: !!r.stock_deducted, createdAt: r.created_at, updatedAt: r.updated_at,
+    approvedAt: r.approved_at || null, approvedBy: r.approved_by_email || '', createdByEmail: r.created_by_email || '' };
 }
-function mapDocToDb(d) {
+function mapDocToDb(d, isInsert) {
+  const row = mapDocFieldsToDb(d);
+  if (isInsert) {
+    row.created_by = CURRENT_USER ? CURRENT_USER.id : null;
+    row.created_by_email = CURRENT_USER ? CURRENT_USER.email : null;
+    if (d.type === 'quote' && canApproveQuotes()) row.approved_at = new Date().toISOString();
+  }
+  return row;
+}
+function mapDocFieldsToDb(d) {
   return { type: d.type, number: d.number, status: d.status, customer_num: d.customer.num, customer_snapshot: d.customer,
     truck_reg: d.truckReg, reg_6m: d.reg6m, reg_12m: d.reg12m, customer_depo: d.customerDepo, po_number: d.poNumber,
     jobcard: d.jobcard, tec: d.tec, hkm: d.hkm, quote_ref: d.quoteRef,
     issue_date: d.issueDate || null, due_date: d.dueDate || null,
     items: d.items, subtotal: d.subtotal, tax_total: d.taxTotal, total: d.total,
-    exported_to_qbo: !!d.exportedToQBO, stock_deducted: !!d.stockDeducted,
-    created_by: CURRENT_USER ? CURRENT_USER.id : null,
-    created_by_email: CURRENT_USER ? CURRENT_USER.email : null };
+    exported_to_qbo: !!d.exportedToQBO, stock_deducted: !!d.stockDeducted };
 }
 function mapCompanyFromDb(r) {
   return { name: r.name, address: r.address, city: r.city, phone: r.phone, email: r.email, vat: r.vat, reg: r.reg,
@@ -333,7 +390,7 @@ function mapCompanyToDb(c) {
 async function loadAll() {
   const [custRes, itemRes, docRes, counterRes, companyRes] = await Promise.all([
     supabaseClient.from('customers').select('*').order('name'),
-    supabaseClient.from('items').select('*').order('description'),
+    supabaseClient.from('items').select('*').eq('archived', false).order('description'),
     supabaseClient.from('documents').select('*').order('created_at', { ascending: false }),
     supabaseClient.from('counters').select('*').eq('id', 1).single(),
     supabaseClient.from('company_settings').select('*').eq('id', 1).single(),
@@ -377,6 +434,8 @@ function customerNumTaken(num) {
   return STATE.customers.some(c => String(c.num).trim().toLowerCase() === n);
 }
 async function createCustomerRecord(fields, manualNum) {
+  const sameName = STATE.customers.find(c => normDesc(c.name) === normDesc(fields.name));
+  if (sameName && !confirm(`A customer called "${sameName.name}" already exists (#${sameName.num}).\n\nAdd another customer with the same name anyway?`)) return null;
   let num;
   manualNum = (manualNum || '').trim();
   if (manualNum) {
@@ -402,23 +461,26 @@ async function createCustomerRecord(fields, manualNum) {
     alert(dup ? `Customer number ${num} is already in use (someone may have just added it). Please try again.` : 'Could not save this customer — ' + insErr.message);
     return null;
   }
-  STATE.customers.push(cust);
+  putRow(STATE.customers, 'num', cust);
   return cust;
 }
 async function createItemRecord(fields) {
+  const dup = findDuplicateItem(fields.desc, null);
+  if (dup) { alert(duplicateItemMessage(dup)); return null; }
   const { data: numData, error: numErr } = await supabaseClient.rpc('next_item_code');
   if (numErr) { alert('Could not assign an item code — ' + numErr.message); return null; }
   const code = `ITM-${String(numData).padStart(4, '0')}`;
   const item = { code, isNew: true, stockQty: null, ...fields };
-  const { error: insErr } = await supabaseClient.from('items').insert(mapItemToDb(item));
+  const { data: insRow, error: insErr } = await supabaseClient.from('items').insert(mapItemToDb(item)).select('id, created_at').single();
   if (insErr) { alert('Could not save this item — ' + insErr.message); return null; }
+  item.id = insRow.id; item.createdAt = insRow.created_at;
   if (item.stockQty !== null) {
     await supabaseClient.from('stock_movements').insert({
       item_code: code, movement_type: 'initial_count', qty_change: item.stockQty, qty_before: 0, qty_after: item.stockQty,
       created_by: CURRENT_USER ? CURRENT_USER.id : null, created_by_email: CURRENT_USER ? CURRENT_USER.email : null,
     });
   }
-  STATE.items.push(item);
+  putRow(STATE.items, 'code', item);
   STATE.counters.itemCode = numData;
   return item;
 }
@@ -449,12 +511,25 @@ async function moveStock(code, delta, type, reference) {
   if (catalogItem && newQty !== null) catalogItem.stockQty = Number(newQty);
 }
 // sign = -1 deducts, sign = +1 restores, for every tracked line on the document.
+// All stock lines for a save go to the database in ONE call (previously one
+// call per line, which made saving slow from South Africa).
+async function moveStockBatch(moves) {
+  if (!moves.length) return;
+  const { data, error } = await supabaseClient.rpc('record_stock_movements', {
+    p_moves: moves.map(m => ({ code: m.code, delta: m.delta, type: m.type, reference: m.reference || null, notes: m.notes || null })),
+  });
+  if (error) { alert('Stock could not be updated — ' + error.message); return; }
+  for (const [code, qty] of Object.entries(data || {})) {
+    const it = STATE.items.find(x => x.code === code);
+    if (it && qty !== null) it.stockQty = Number(qty);
+  }
+}
 async function adjustStockForDoc(doc, sign) {
   const kind = doc.type === 'quote' ? 'quote' : 'invoice';
   const movementType = sign < 0 ? `${kind}_deduct` : `${kind}_restore`;
   const reference = `${kind === 'quote' ? 'Quote' : 'Invoice'} ${doc.number}`;
   const qtys = trackedQtyByCode(doc.items);
-  for (const code of Object.keys(qtys)) await moveStock(code, sign * qtys[code], movementType, reference);
+  await moveStockBatch(Object.keys(qtys).filter(code => qtys[code]).map(code => ({ code, delta: sign * qtys[code], type: movementType, reference })));
 }
 // When a saved document is edited, move only the difference per item.
 async function adjustStockForEdit(oldDoc, newDoc) {
@@ -463,7 +538,7 @@ async function adjustStockForEdit(oldDoc, newDoc) {
   const codes = new Set([...Object.keys(before), ...Object.keys(after)]);
   const kind = newDoc.type === 'quote' ? 'quote' : 'invoice';
   const reference = `${kind === 'quote' ? 'Quote' : 'Invoice'} ${newDoc.number} (edited)`;
-  for (const code of codes) await moveStock(code, (before[code] || 0) - (after[code] || 0), `${kind}_edit`, reference);
+  await moveStockBatch([...codes].map(code => ({ code, delta: (before[code] || 0) - (after[code] || 0), type: `${kind}_edit`, reference })).filter(m => m.delta));
 }
 // Warns before saving if any tracked item would go below zero. At Hakuna
 // the parts are normally already fitted by the time a quote is done, so a
@@ -544,12 +619,10 @@ async function declineQuote(doc) {
     doc.stockDeducted = false;
   } else if (doc.stockDeducted) {
     // History note only — no quantity change.
-    for (const code of Object.keys(trackedQtyByCode(doc.items))) {
-      await supabaseClient.rpc('record_stock_movement', {
-        p_code: code, p_delta: 0, p_type: 'quote_used', p_reference: `Quote ${doc.number}`,
-        p_notes: 'Quote declined — parts used on the job, not returned to stock',
-      });
-    }
+    await moveStockBatch(Object.keys(trackedQtyByCode(doc.items)).map(code => ({
+      code, delta: 0, type: 'quote_used', reference: `Quote ${doc.number}`,
+      notes: 'Quote declined — parts used on the job, not returned to stock',
+    })));
   }
   doc.status = 'Declined';
   doc.updatedAt = nowIso;
@@ -644,7 +717,8 @@ function dashboardFilteredDocs() {
   return docs.filter(d => {
     if (dashFilter === 'quotes' && d.type !== 'quote') return false;
     if (dashFilter === 'invoices' && d.type !== 'invoice') return false;
-    if (dashFilter !== 'all' && dashFilter !== 'quotes' && dashFilter !== 'invoices' && d.status !== dashFilter) return false;
+    if (dashFilter === 'awaiting' && !quoteNeedsApproval(d)) return false;
+    if (!['all', 'quotes', 'invoices', 'awaiting'].includes(dashFilter) && d.status !== dashFilter) return false;
     if (dashSearch) {
       const s = dashSearch.toLowerCase();
       const hay = `${d.number} ${d.customer.name} ${d.truckReg}`.toLowerCase();
@@ -662,9 +736,10 @@ function dashboardRowsHtml(filtered) {
       <td data-label="Customer"><a href="#" data-cust="${esc(d.customer.num)}" class="cust-link">${esc(d.customer.name)}</a></td>
       <td data-label="Truck Reg">${esc(d.truckReg)}</td>
       <td data-label="Total">R ${fmtMoney(d.total)}</td>
-      <td data-label="Status"><span class="pill ${d.status.toLowerCase()}">${d.status}</span></td>
+      <td data-label="Status"><span class="pill ${d.status.toLowerCase()}">${d.status}</span>${approvalBadge(d)}</td>
       <td data-label="Date">${fmtDate(d.issueDate)}</td>
       <td style="white-space:nowrap;">
+        ${approveButtonHtml(d)}
         <button class="btn ghost small" data-act="view" data-id="${d.id}">View</button>
         <button class="btn ghost small" data-act="edit" data-id="${d.id}">Edit</button>
         ${d.type === 'quote' && d.status !== 'Converted' ? `<button class="btn accent small" data-act="convert" data-id="${d.id}">Convert to Invoice</button>` : ''}
@@ -673,6 +748,27 @@ function dashboardRowsHtml(filtered) {
         <button class="btn danger small" data-act="delete" data-id="${d.id}">Delete</button>
       </td>
     </tr>`).join('') || `<tr><td colspan="8" style="text-align:center;color:var(--steel);padding:24px;">No documents yet. Create your first quote above.</td></tr>`;
+}
+
+function approvalBadge(d) {
+  if (!quoteIsOpen(d)) return '';
+  if (d.approvedAt) {
+    const who = (d.approvedBy || '').split('@')[0];
+    return ` <span class="pill approved" title="Approved${who ? ' by ' + esc(who) : ''} ${fmtDate(String(d.approvedAt).slice(0, 10))}">✓ Approved</span>`;
+  }
+  return ` <span class="pill awaiting">Awaiting approval</span>`;
+}
+function approveButtonHtml(d) {
+  return canApproveQuotes() && quoteNeedsApproval(d) ? `<button class="btn small" data-act="approve" data-id="${d.id}" style="background:#166534;color:#fff;">Approve</button>` : '';
+}
+async function approveQuote(doc) {
+  if (!canApproveQuotes() || !quoteNeedsApproval(doc)) return false;
+  const { data, error } = await supabaseClient.from('documents').update({ approved_at: new Date().toISOString() })
+    .eq('id', doc.id).select('approved_at, approved_by_email').single();
+  if (error) { alert('Could not approve this quote — ' + error.message); return false; }
+  doc.approvedAt = data.approved_at;
+  doc.approvedBy = data.approved_by_email || (CURRENT_USER ? CURRENT_USER.email : '');
+  return true;
 }
 
 function wireDashboardRowActions(tbody) {
@@ -688,6 +784,7 @@ function wireDashboardRowActions(tbody) {
       if (btn.dataset.act === 'edit') { loadDocIntoBuilder(doc); }
       if (btn.dataset.act === 'convert') { await convertQuoteToInvoice(doc); }
       if (btn.dataset.act === 'decline') { if (await declineQuote(doc)) refreshDashboardBody(); }
+      if (btn.dataset.act === 'approve') { if (await approveQuote(doc)) refreshDashboardBody(); }
       if (btn.dataset.act === 'paid') {
         doc.status = 'Paid'; doc.updatedAt = new Date().toISOString();
         const { error } = await supabaseClient.from('documents').update({ status: 'Paid', updated_at: doc.updatedAt }).eq('id', id);
@@ -738,8 +835,8 @@ function renderDashboard(c) {
     <div class="card">
       <div class="toolbar">
         <div style="display:flex;gap:6px;flex-wrap:wrap;" id="dashChips">
-          ${['all','quotes','invoices','Draft','Sent','Accepted','Converted','Declined','Paid','Overdue'].map(f =>
-            `<span class="chip ${dashFilter===f?'active':''}" data-f="${f}">${f[0].toUpperCase()+f.slice(1)}</span>`
+          ${['all','quotes','invoices','awaiting','Draft','Sent','Accepted','Converted','Declined','Paid','Overdue'].map(f =>
+            `<span class="chip ${dashFilter===f?'active':''}" data-f="${f}">${f === 'awaiting' ? `Awaiting approval (${STATE.documents.filter(quoteNeedsApproval).length})` : f[0].toUpperCase()+f.slice(1)}</span>`
           ).join('')}
         </div>
         <input type="text" placeholder="Search customer, number, truck reg…" style="max-width:260px;" id="dashSearchInput" value="${esc(dashSearch)}">
@@ -791,7 +888,7 @@ async function convertQuoteToInvoice(quote) {
   if (!quoteHeldStock) await adjustStockForDoc(inv, -1);
   inv.stockDeducted = true;
 
-  const { data: insData, error: insErr } = await supabaseClient.from('documents').insert(mapDocToDb(inv)).select().single();
+  const { data: insData, error: insErr } = await supabaseClient.from('documents').insert(mapDocToDb(inv, true)).select().single();
   if (insErr) {
     if (!quoteHeldStock) await adjustStockForDoc(inv, 1);
     alert(`Could not create the invoice — ${insErr.message}`); return;
@@ -805,7 +902,7 @@ async function convertQuoteToInvoice(quote) {
   if (updErr) { alert(`Invoice was created, but could not mark the quote as converted — ${updErr.message}. Please check this quote before deleting or declining it.`); }
   else { quote.status = 'Converted'; quote.stockDeducted = false; quote.updatedAt = new Date().toISOString(); }
 
-  STATE.documents.unshift(inv);
+  putRow(STATE.documents, 'id', inv, true);
   loadDocIntoBuilder(inv);
 }
 
@@ -860,10 +957,11 @@ function renderCustomerSummary(c, customerNum) {
               <td data-label="Type">${d.type === 'quote' ? 'Quote' : 'Invoice'}</td>
               <td data-label="Truck Reg">${esc(d.truckReg)}</td>
               <td data-label="Total">R ${fmtMoney(d.total)}</td>
-              <td data-label="Status"><span class="pill ${d.status.toLowerCase()}">${d.status}</span></td>
+              <td data-label="Status"><span class="pill ${d.status.toLowerCase()}">${d.status}</span>${approvalBadge(d)}</td>
               <td data-label="Date">${fmtDate(d.issueDate)}</td>
               <td style="white-space:nowrap;">
-                <button class="btn ghost small" data-act="view" data-id="${d.id}">View</button>
+                ${approveButtonHtml(d)}
+        <button class="btn ghost small" data-act="view" data-id="${d.id}">View</button>
                 <button class="btn ghost small" data-act="edit" data-id="${d.id}">Edit</button>
                 ${d.type === 'quote' && d.status !== 'Converted' ? `<button class="btn accent small" data-act="convert" data-id="${d.id}">Convert to Invoice</button>` : ''}
         ${d.type === 'quote' && d.status !== 'Converted' && d.status !== 'Declined' ? `<button class="btn ghost small" data-act="decline" data-id="${d.id}">Decline</button>` : ''}
@@ -919,6 +1017,7 @@ function renderCustomerSummary(c, customerNum) {
       if (btn.dataset.act === 'edit') { loadDocIntoBuilder(doc); }
       if (btn.dataset.act === 'convert') { await convertQuoteToInvoice(doc); }
       if (btn.dataset.act === 'decline') { if (await declineQuote(doc)) renderCustomerSummary(c, customerNum); }
+      if (btn.dataset.act === 'approve') { if (await approveQuote(doc)) renderCustomerSummary(c, customerNum); }
       if (btn.dataset.act === 'paid') {
         doc.status = 'Paid'; doc.updatedAt = new Date().toISOString();
         const { error } = await supabaseClient.from('documents').update({ status: 'Paid', updated_at: doc.updatedAt }).eq('id', id);
@@ -1254,7 +1353,14 @@ function renderInlineCustomerForm() {
   };
 }
 
+let SAVE_IN_FLIGHT = false;
 async function saveDocument(type, preview) {
+  if (SAVE_IN_FLIGHT) return;
+  SAVE_IN_FLIGHT = true;
+  try { return await saveDocumentInner(type, preview); }
+  finally { SAVE_IN_FLIGHT = false; }
+}
+async function saveDocumentInner(type, preview) {
   const d = CURRENT_DRAFT;
   if (!d.customer) { alert('Please select or add a customer first — use the customer search box above and click a result to select it.'); return; }
   computeTotals(d);
@@ -1277,7 +1383,7 @@ async function saveDocument(type, preview) {
       d.stockDeducted = true;
       deductedNow = true;
     }
-    const { data: insData, error: insErr } = await supabaseClient.from('documents').insert(mapDocToDb(d)).select().single();
+    const { data: insData, error: insErr } = await supabaseClient.from('documents').insert(mapDocToDb(d, true)).select().single();
     if (insErr) {
       if (deductedNow) { await adjustStockForDoc(d, 1); d.stockDeducted = false; }
       alert(`Could not save this ${type} — ${insErr.message}`); return;
@@ -1285,13 +1391,16 @@ async function saveDocument(type, preview) {
     d.id = insData.id;
     d.createdAt = insData.created_at;
     d.updatedAt = insData.updated_at;
-    STATE.documents.unshift(d);
+    putRow(STATE.documents, 'id', d, true);
   } else {
     d.updatedAt = new Date().toISOString();
     const original = STATE.documents[existingIdx];
     if (original.stockDeducted && d.stockDeducted && !confirmStockShortfall(editDeltas(original, d), `this ${type}`)) return;
-    const { error: updErr } = await supabaseClient.from('documents').update(mapDocToDb(d)).eq('id', d.id);
+    const { data: updRow, error: updErr } = await supabaseClient.from('documents').update(mapDocToDb(d)).eq('id', d.id)
+      .select('approved_at, approved_by_email').maybeSingle();
     if (updErr) { alert(`Could not save this ${type} — ${updErr.message}`); return; }
+    // Changes by Paula/Adele clear an earlier approval (done in the database).
+    if (updRow) { d.approvedAt = updRow.approved_at || null; d.approvedBy = updRow.approved_by_email || ''; }
     // Only documents currently holding stock adjust on edit (not declined,
     // converted, or older quotes that never took stock).
     if (original.stockDeducted && d.stockDeducted) await adjustStockForEdit(original, d);
@@ -1391,7 +1500,12 @@ function openPrintPreview(doc) {
       ${footer}
     </div>
   `;
-  document.getElementById('printArea').innerHTML = html;
+  // Paula/Adele can't print or send a quote until Jacobus/Lizette approve it.
+  const blocked = quoteBlockedForMe(doc);
+  document.getElementById('printArea').innerHTML = blocked ? '' : html;
+  const approvalBar = !quoteIsOpen(doc) ? '' : doc.approvedAt
+    ? `<div style="padding:8px 20px;background:#dcfce7;color:#166534;font-size:13px;">✓ Approved${doc.approvedBy ? ' by ' + esc(doc.approvedBy.split('@')[0]) : ''} on ${fmtDate(String(doc.approvedAt).slice(0, 10))}</div>`
+    : `<div style="padding:8px 20px;background:#fef3c7;color:#92400e;font-size:13px;">Awaiting approval — Jacobus or Lizette must approve this quote before it can be printed or sent.</div>`;
 
   const modalHtml = `
     <div id="previewModal" style="position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:100;overflow:auto;padding:24px;" class="no-print">
@@ -1399,11 +1513,13 @@ function openPrintPreview(doc) {
         <div style="padding:12px 20px;background:var(--ink);color:#fff;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
           <b>${isInvoice ? 'Invoice' : 'Quote'} ${esc(doc.number)} — Preview</b>
           <div>
-            <button class="btn accent small" id="doPrintBtn">Print / Save as PDF</button>
-            <button class="btn small" id="doEmailBtn" style="background:#3b5a8c;">Email ${isInvoice ? 'Invoice' : 'Quote'}</button>
+            ${canApproveQuotes() && quoteNeedsApproval(doc) ? `<button class="btn small" id="doApproveBtn" style="background:#166534;color:#fff;">Approve Quote</button>` : ''}
+            <button class="btn accent small" id="doPrintBtn" ${blocked ? 'disabled title="Waiting for approval"' : ''}>Print / Save as PDF</button>
+            <button class="btn small" id="doEmailBtn" style="background:#3b5a8c;" ${blocked ? 'disabled title="Waiting for approval"' : ''}>Email ${isInvoice ? 'Invoice' : 'Quote'}</button>
             <button class="btn ghost small" id="closePreviewBtn" style="background:#fff;">Close</button>
           </div>
         </div>
+        ${approvalBar}
         <div style="max-height:80vh;overflow:auto;">${html}</div>
       </div>
     </div>
@@ -1412,8 +1528,16 @@ function openPrintPreview(doc) {
   wrapper.innerHTML = modalHtml;
   document.body.appendChild(wrapper.firstElementChild);
   document.getElementById('closePreviewBtn').onclick = () => document.getElementById('previewModal').remove();
-  document.getElementById('doPrintBtn').onclick = () => window.print();
-  document.getElementById('doEmailBtn').onclick = () => emailDocument(doc);
+  document.getElementById('doPrintBtn').onclick = () => { if (!quoteBlockedForMe(doc)) window.print(); };
+  document.getElementById('doEmailBtn').onclick = () => { if (!quoteBlockedForMe(doc)) emailDocument(doc); };
+  const approveBtn = document.getElementById('doApproveBtn');
+  if (approveBtn) approveBtn.onclick = async () => {
+    if (!(await approveQuote(doc))) return;
+    document.getElementById('previewModal').remove();
+    if (CURRENT_TAB === 'dashboard') { refreshDashboardBody(); refreshAwaitingChip(); }
+    else if (CURRENT_TAB === 'customerSummary') renderContent();
+    openPrintPreview(doc);
+  };
 }
 
 /* ===================== Customer statements ===================== */
@@ -1699,11 +1823,20 @@ function itemMatches(x, q) {
 function isLowStock(x) {
   return x.stockQty !== null && x.stockQty < STATE.company.reorderThreshold;
 }
+let itemDupOnly = false;
+function duplicateKeys() {
+  const counts = {};
+  for (const x of STATE.items) { const k = normDesc(x.desc); counts[k] = (counts[k] || 0) + 1; }
+  return new Set(Object.keys(counts).filter(k => counts[k] > 1));
+}
 function itemsTabRowsHtml() {
-  const filtered = STATE.items.filter(x => {
+  const dupKeys = itemDupOnly ? duplicateKeys() : null;
+  let filtered = STATE.items.filter(x => {
+    if (dupKeys && !dupKeys.has(normDesc(x.desc))) return false;
     if (itemLowStockOnly && !isLowStock(x)) return false;
     return !itemSearchTab || itemMatches(x, itemSearchTab.toLowerCase());
   });
+  if (dupKeys) filtered = filtered.slice().sort((a, b) => normDesc(a.desc).localeCompare(normDesc(b.desc)) || String(a.createdAt).localeCompare(String(b.createdAt)));
   const rows = filtered.slice(0, 200).map(x => {
     const isLow = isLowStock(x);
     const stockCell = !canManageStock()
@@ -1717,12 +1850,15 @@ function itemsTabRowsHtml() {
          <button class="btn ghost small stock-correct-btn" data-code="${esc(x.code)}" style="margin-left:6px;">Correct</button>
          <button class="btn ghost small stock-history-btn" data-code="${esc(x.code)}">History</button>`;
     const canEditItem = canManageStock() || x.stockQty === null;
+    const usedOn = itemDupOnly ? STATE.documents.filter(d => (d.items || []).some(li => li.code === x.code)).length : 0;
     return `
     <tr style="${isLow ? 'background:#fef2f2;' : ''}">
       <td data-label="Code">${esc(x.code)}</td>
       <td data-label="Stock Code">${x.stockCode ? esc(x.stockCode) : '<span style="color:var(--steel);">—</span>'}</td>
       <td data-label="Description">${esc(x.desc)}${x.isNew ? '<span class="badge-new">NEW</span>':''}${isLow ? ' <span class="pill overdue">Reorder</span>' : ''}
         ${canEditItem ? `<button class="btn ghost small item-edit-btn" data-code="${esc(x.code)}" style="margin-left:6px;">Edit</button>` : ''}
+        ${canDeleteItems() ? `<button class="btn danger small item-delete-btn" data-code="${esc(x.code)}" style="margin-left:4px;">Delete</button>` : ''}
+        ${itemDupOnly ? `<div class="note" style="margin-top:2px;">Added ${fmtDate(String(x.createdAt || '').slice(0, 10)) || '—'} · on ${usedOn} quote/invoice${usedOn === 1 ? '' : 's'}</div>` : ''}
       </td>
       <td data-label="Price">R ${fmtMoney(x.price)}</td>
       <td data-label="VAT">${x.vat}</td>
@@ -1731,6 +1867,27 @@ function itemsTabRowsHtml() {
   }).join('');
   const more = filtered.length > 200 ? `<p class="note">Showing first 200 of ${filtered.length} matches — refine your search to see more.</p>` : '';
   return { rows, more };
+}
+// Items with stock history can't be erased (the history is permanent), so
+// those are hidden instead: they vanish from every list and search.
+async function deleteOrHideItem(code) {
+  if (!canDeleteItems()) return;
+  const item = STATE.items.find(x => x.code === code);
+  if (!item) return;
+  const usedOn = STATE.documents.filter(d => (d.items || []).some(li => li.code === code)).length;
+  const { count, error: cErr } = await supabaseClient.from('stock_movements').select('id', { count: 'exact', head: true }).eq('item_code', code);
+  if (cErr) { alert('Could not check this item — ' + cErr.message); return; }
+  const hasHistory = (count || 0) > 0;
+  let msg = `Delete "${item.desc}" (${code})?`;
+  if (usedOn) msg += `\n\nIt appears on ${usedOn} quote/invoice${usedOn === 1 ? '' : 's'}. Those keep their lines exactly as they are.`;
+  if (hasHistory) msg += `\n\nThis item has stock history, so it can't be erased. It will be hidden instead: it disappears from all lists and searches, and its stock (${item.stockQty === null ? 'not tracked' : item.stockQty}) no longer counts.`;
+  if (!confirm(msg)) return;
+  const { error } = hasHistory
+    ? await supabaseClient.from('items').update({ archived: true, stock_code: null }).eq('code', code)
+    : await supabaseClient.from('items').delete().eq('code', code);
+  if (error) { alert('Could not delete this item — ' + error.message); return; }
+  STATE.items = STATE.items.filter(x => x.code !== code);
+  if (CURRENT_TAB === 'items') renderContent();
 }
 function openEditItemModal(code) {
   const item = STATE.items.find(x => x.code === code);
@@ -1761,6 +1918,8 @@ function openEditItemModal(code) {
   document.getElementById('ieSaveBtn').onclick = async () => {
     const newDesc = document.getElementById('ieDesc').value.trim();
     if (!newDesc) { alert('Description is required.'); return; }
+    const dupEdit = findDuplicateItem(newDesc, code);
+    if (dupEdit) { alert(`Another item is already called "${dupEdit.desc}" (${dupEdit.code}). Use a different description.`); return; }
     const newPrice = Number(document.getElementById('iePrice').value) || 0;
     const newVat = document.getElementById('ieVat').value;
     const scInput = document.getElementById('ieStockCode');
@@ -1787,6 +1946,7 @@ function openEditItemModal(code) {
 }
 function wireItemsTabStockInputs(tbody) {
   tbody.querySelectorAll('.item-edit-btn').forEach(btn => { btn.onclick = () => openEditItemModal(btn.dataset.code); });
+  tbody.querySelectorAll('.item-delete-btn').forEach(btn => { btn.onclick = () => deleteOrHideItem(btn.dataset.code); });
   tbody.querySelectorAll('.stock-set-btn').forEach(btn => {
     btn.onclick = async () => {
       const code = btn.dataset.code;
@@ -1896,6 +2056,7 @@ function renderItems(c) {
       <div class="toolbar">
         <h2 style="border:none;">Items <span class="note">(${STATE.items.length} total)</span></h2>
         <div style="display:flex;gap:8px;align-items:center;">
+          ${canDeleteItems() ? `<span class="chip ${itemDupOnly ? 'active' : ''}" id="dupChip">Possible duplicates (${[...duplicateKeys()].reduce((n, k) => n + STATE.items.filter(x => normDesc(x.desc) === k).length, 0)})</span>` : ''}
           <span class="chip ${itemLowStockOnly ? 'active' : ''}" id="lowStockChip">${lowStockCount} Low Stock</span>
           <input type="text" placeholder="Search…" id="itemTabSearch" value="${esc(itemSearchTab)}" style="max-width:240px;">
         </div>
@@ -1913,6 +2074,8 @@ function renderItems(c) {
   wireItemsTabStockInputs(document.getElementById('itemTabTbody'));
   document.getElementById('lowStockChip').onclick = () => { itemLowStockOnly = !itemLowStockOnly; renderItems(c); };
   document.getElementById('itemTabSearch').oninput = e => { itemSearchTab = e.target.value; refreshItemsTabBody(); };
+  const dupChip = document.getElementById('dupChip');
+  if (dupChip) dupChip.onclick = () => { itemDupOnly = !itemDupOnly; renderItems(c); };
   document.getElementById('addItemTabBtn').onclick = () => {
     const box = document.getElementById('itemTabForm');
     box.innerHTML = `
@@ -2089,15 +2252,7 @@ async function saveStockReceipt() {
     created_by: CURRENT_USER ? CURRENT_USER.id : null, created_by_email: CURRENT_USER ? CURRENT_USER.email : null,
   }).select().single();
   if (insErr) { alert('Could not save receipt — ' + insErr.message); return; }
-  for (const it of validItems) {
-    const { data: newQty, error } = await supabaseClient.rpc('record_stock_movement', {
-      p_code: it.code, p_delta: Number(it.qty), p_type: 'receipt', p_reference: r.reference || insData.id, p_notes: r.notes || null,
-    });
-    if (!error && newQty !== null) {
-      const item = STATE.items.find(x => x.code === it.code);
-      if (item) item.stockQty = newQty;
-    }
-  }
+  await moveStockBatch(validItems.map(it => ({ code: it.code, delta: Number(it.qty), type: 'receipt', reference: r.reference || insData.id, notes: r.notes || null })));
   receiptViewMode = 'list';
   CURRENT_RECEIPT = null;
   renderContent();
@@ -2499,6 +2654,62 @@ function showConfigMissingScreen() {
     </div>`;
 }
 
+/* ===================== Live updates ===================== */
+// Everyone's screen updates by itself when someone else adds or changes an
+// item, customer, quote or invoice, so nobody works from an old list.
+let LIVE_CHANNEL = null;
+let LIVE_TIMER = null;
+function anyModalOpen() {
+  return !!document.querySelector('#previewModal, #declineModal, #itemEditModal, #stockModal, #disposeModal');
+}
+function scheduleLiveRefresh() {
+  clearTimeout(LIVE_TIMER);
+  LIVE_TIMER = setTimeout(function apply() {
+    if (anyModalOpen()) { LIVE_TIMER = setTimeout(apply, 1000); return; }
+    const active = document.activeElement;
+    if (CURRENT_TAB === 'dashboard') { refreshDashboardBody(); refreshAwaitingChip(); }
+    else if (CURRENT_TAB === 'items') {
+      const tb = document.getElementById('itemTabTbody');
+      if (tb && !(active && tb.contains(active))) refreshItemsTabBody();
+    } else if (CURRENT_TAB === 'customers') { refreshCustomersTabBody(); }
+  }, 400);
+}
+function refreshAwaitingChip() {
+  const chip = document.querySelector('#dashChips .chip[data-f="awaiting"]');
+  if (chip) chip.textContent = `Awaiting approval (${STATE.documents.filter(quoteNeedsApproval).length})`;
+}
+function startLiveUpdates() {
+  if (LIVE_CHANNEL || !supabaseClient.channel) return;
+  const onChange = (table, payload) => {
+    const ev = payload.eventType;
+    if (table === 'items') {
+      if (ev === 'DELETE') { STATE.items = STATE.items.filter(x => x.id !== payload.old.id); }
+      else {
+        const it = mapItemFromDb(payload.new);
+        if (it.archived) STATE.items = STATE.items.filter(x => x.code !== it.code);
+        else putRow(STATE.items, 'code', it);
+      }
+    } else if (table === 'customers') {
+      if (ev === 'DELETE') STATE.customers = STATE.customers.filter(x => x.id !== payload.old.id);
+      else putRow(STATE.customers, 'num', mapCustomerFromDb(payload.new));
+    } else if (table === 'documents') {
+      if (ev === 'DELETE') STATE.documents = STATE.documents.filter(x => x.id !== payload.old.id);
+      else putRow(STATE.documents, 'id', mapDocFromDb(payload.new), true);
+    }
+    scheduleLiveRefresh();
+  };
+  LIVE_CHANNEL = supabaseClient.channel('hakuna-live');
+  for (const table of ['items', 'customers', 'documents']) {
+    LIVE_CHANNEL.on('postgres_changes', { event: '*', schema: 'public', table }, payload => {
+      try { onChange(table, payload); } catch (e) { console.error('Live update failed', e); }
+    });
+  }
+  LIVE_CHANNEL.subscribe();
+}
+function stopLiveUpdates() {
+  if (LIVE_CHANNEL) { try { supabaseClient.removeChannel(LIVE_CHANNEL); } catch (e) {} LIVE_CHANNEL = null; }
+}
+
 function showLoginScreen(errorMsg) {
   document.getElementById('appRoot').style.display = 'none';
   document.getElementById('loginScreen').style.display = 'flex';
@@ -2514,7 +2725,7 @@ async function showApp() {
   renderNav();
   document.getElementById('content').innerHTML = '<p style="padding:40px;text-align:center;color:var(--steel);">Loading customers, items and documents…</p>';
   const ok = await loadAll();
-  if (ok) renderContent();
+  if (ok) { renderNav(); renderContent(); startLiveUpdates(); }
 }
 
 async function handleLogin() {
@@ -2531,6 +2742,7 @@ async function handleLogin() {
 }
 
 async function handleLogout() {
+  stopLiveUpdates();
   await supabaseClient.auth.signOut();
   CURRENT_USER = null;
   STATE.loaded = false;
