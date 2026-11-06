@@ -755,6 +755,13 @@ function dashboardRowsHtml(filtered) {
     </tr>`).join('') || `<tr><td colspan="8" style="text-align:center;color:var(--steel);padding:24px;">No documents yet. Create your first quote above.</td></tr>`;
 }
 
+function linkedQuoteFor(inv) {
+  const ref = String(inv.quoteRef || '').trim();
+  return ref ? STATE.documents.find(x => x.type === 'quote' && String(x.number) === ref) || null : null;
+}
+function linkedInvoicesFor(q) {
+  return q && q.number ? STATE.documents.filter(x => x.type === 'invoice' && String(x.quoteRef || '').trim() === String(q.number)) : [];
+}
 function approvalBadge(d) {
   if (!quoteIsOpen(d)) return '';
   if (d.approvedAt) {
@@ -1111,8 +1118,9 @@ function renderDocBuilder(c, type) {
           </div>
           ${isInvoice ? `
             <div class="field"><label>Due Date</label><input type="date" id="dueDate" value="${d.dueDate}"></div>
-            <div class="field"><label>Quote Ref.</label><input type="text" id="quoteRef" value="${esc(d.quoteRef)}" placeholder="e.g. 1011"></div>
-          ` : ''}
+            <div class="field"><label>Quote No. <span class="note">(the quote this invoice was created from)</span></label><input type="text" id="quoteRef" value="${esc(d.quoteRef)}" placeholder="e.g. 1011"></div>
+            ${linkedQuoteFor(d) ? `<div class="note">Created from <b>Quote ${esc(linkedQuoteFor(d).number)}</b>. Its PO number carries through to this invoice automatically.</div>` : ''}
+          ` : (linkedInvoicesFor(d).length ? `<div class="note" style="margin-top:6px;">Invoiced on <b>${linkedInvoicesFor(d).map(i => 'Invoice ' + esc(i.number)).join(', ')}</b>. A PO number added here carries through to the invoice automatically.</div>` : '')}
         </div>
       </div>
     </div>
@@ -1417,6 +1425,15 @@ async function saveDocumentInner(type, preview) {
     // converted, or older quotes that never took stock).
     if (original.stockDeducted && d.stockDeducted) await adjustStockForEdit(original, d);
     STATE.documents[existingIdx] = d;
+    // The database copies a quote's new PO number onto its invoice (if that
+    // invoice's PO was blank or still the old one). Mirror it here.
+    const oldPo = (original.poNumber || '').trim(), newPo = (d.poNumber || '').trim();
+    if (d.type === 'quote' && oldPo !== newPo) {
+      const updated = linkedInvoicesFor(d).filter(i => !(i.poNumber || '').trim() || (i.poNumber || '').trim() === oldPo);
+      updated.forEach(i => { i.poNumber = newPo; });
+      const inQbo = updated.filter(i => i.exportedToQBO);
+      if (inQbo.length) alert(`The PO number was updated on ${inQbo.map(i => 'Invoice ' + i.number).join(', ')}, which was already exported to QuickBooks. Please update the PO number in QuickBooks as well.`);
+    }
   }
 
   if (preview) { renderContent(); openPrintPreview(d); }
@@ -1451,7 +1468,7 @@ function openPrintPreview(doc) {
   const co = STATE.company;
   const isInvoice = doc.type === 'invoice';
   const detailRows = isInvoice ? [
-    ['Invoice No.', doc.number], ['Date', fmtDate(doc.issueDate)], ['Quote Ref.', doc.quoteRef || '—'],
+    ['Invoice No.', doc.number], ['Date', fmtDate(doc.issueDate)], ['Quote No.', doc.quoteRef || '—'],
     ['Truck Registration Number', doc.truckReg], ['Reg. 6m', doc.reg6m], ['Reg. 12m', doc.reg12m],
     ['Customer Depo', doc.customerDepo], ['PO Number', doc.poNumber], ['Jobcard', doc.jobcard], ['Tec', doc.tec], ['HKM', doc.hkm],
   ] : [
