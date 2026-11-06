@@ -104,6 +104,11 @@
   .doc-totals{max-width:340px;margin-left:auto;font-size:13px;}
   .doc-totals .trow{display:flex;justify-content:space-between;padding:5px 8px;}
   .doc-totals .trow.total{font-weight:800;font-size:15px;border-top:2px solid var(--ink);color:var(--accent);}
+  .doc-bottom{display:flex;gap:24px;align-items:flex-start;}
+  .doc-bottom .doc-totals{flex:0 0 340px;margin-left:auto;}
+  .doc-special{flex:1;min-width:0;font-size:12px;padding-top:5px;}
+  .doc-special-heading{font-weight:800;font-size:13px;border-bottom:2px solid var(--accent);padding-bottom:4px;margin-bottom:6px;}
+  .doc-special-text{white-space:pre-wrap;word-wrap:break-word;line-height:1.45;}
   .doc-banking-heading{font-weight:800;font-size:13px;border-bottom:2px solid var(--accent);padding-bottom:4px;margin:22px 0 8px;}
   .doc-banking{display:flex;gap:30px;font-size:12px;}
   .doc-banking div b{display:block;margin-bottom:3px;}
@@ -352,7 +357,7 @@ function mapItemToDb(it) {
 function mapDocFromDb(r) {
   return { id: r.id, type: r.type, number: r.number, status: r.status, customer: r.customer_snapshot,
     truckReg: r.truck_reg || '', reg6m: r.reg_6m || '', reg12m: r.reg_12m || '', customerDepo: r.customer_depo || '',
-    poNumber: r.po_number || '', jobcard: r.jobcard || '', tec: r.tec || '', hkm: r.hkm || '', quoteRef: r.quote_ref || '',
+    poNumber: r.po_number || '', jobcard: r.jobcard || '', tec: r.tec || '', hkm: r.hkm || '', quoteRef: r.quote_ref || '', specialNotes: r.special_notes || '',
     issueDate: r.issue_date || '', dueDate: r.due_date || '', items: r.items || [],
     subtotal: Number(r.subtotal) || 0, taxTotal: Number(r.tax_total) || 0, total: Number(r.total) || 0,
     exportedToQBO: r.exported_to_qbo, stockDeducted: !!r.stock_deducted, createdAt: r.created_at, updatedAt: r.updated_at,
@@ -370,7 +375,7 @@ function mapDocToDb(d, isInsert) {
 function mapDocFieldsToDb(d) {
   return { type: d.type, number: d.number, status: d.status, customer_num: d.customer.num, customer_snapshot: d.customer,
     truck_reg: d.truckReg, reg_6m: d.reg6m, reg_12m: d.reg12m, customer_depo: d.customerDepo, po_number: d.poNumber,
-    jobcard: d.jobcard, tec: d.tec, hkm: d.hkm, quote_ref: d.quoteRef,
+    jobcard: d.jobcard, tec: d.tec, hkm: d.hkm, quote_ref: d.quoteRef, special_notes: (d.specialNotes || '').trim() || null,
     issue_date: d.issueDate || null, due_date: d.dueDate || null,
     items: d.items, subtotal: d.subtotal, tax_total: d.taxTotal, total: d.total,
     exported_to_qbo: !!d.exportedToQBO, stock_deducted: !!d.stockDeducted };
@@ -1047,6 +1052,7 @@ function blankDraft(type) {
     customer: null,
     truckReg: '', reg6m: '', reg12m: '', customerDepo: '', poNumber: '', jobcard: '', tec: '', hkm: '',
     quoteRef: '',
+    specialNotes: '',
     issueDate: todayISO(),
     dueDate: type === 'invoice' ? addDays(todayISO(), 30) : '',
     items: [{ code: '', desc: '', qty: 1, rate: 0, vat: 'Standard', notes: '' }],
@@ -1132,6 +1138,10 @@ function renderDocBuilder(c, type) {
         <tbody id="lineItemsBody"></tbody>
       </table>
       <button class="btn ghost small" id="addLineBtn" style="margin-top:8px;">+ Add Line</button>
+      <div class="field" style="margin-top:14px;">
+        <label>Special notes <span class="note">(optional — printed to the left of the totals)</span></label>
+        <textarea id="specialNotes" rows="3" maxlength="600" style="width:100%;resize:vertical;" placeholder="e.g. Parts to be ordered, 3–5 working days. Price valid on full order only.">${esc(d.specialNotes || '')}</textarea>
+      </div>
       <div class="totals-box" style="margin-top:16px;">
         <div class="trow"><span>Subtotal</span><span>R ${fmtMoney(d.subtotal)}</span></div>
         <div class="trow"><span>VAT (15%)</span><span>R ${fmtMoney(d.taxTotal)}</span></div>
@@ -1294,6 +1304,8 @@ function wireBuilderEvents(type) {
   const addCustInlineBtn = document.getElementById('addCustInlineBtn');
   if (addCustInlineBtn) addCustInlineBtn.onclick = () => renderInlineCustomerForm();
 
+  const specialNotesEl = document.getElementById('specialNotes');
+  if (specialNotesEl) specialNotesEl.oninput = e => { d.specialNotes = e.target.value; };
   const addLineBtn = document.getElementById('addLineBtn');
   if (addLineBtn) addLineBtn.onclick = () => { d.items.push({ code:'', desc:'', qty:1, rate:0, vat:'Standard', notes: '' }); renderLineItemsRows(); updateTotalsDisplay(); };
 
@@ -1487,10 +1499,13 @@ function openPrintPreview(doc) {
         <thead><tr><th>Item Code</th><th>Description</th><th>Tax</th><th>Qty</th><th>Rate</th><th>Amount</th></tr></thead>
         <tbody>${itemsRows}</tbody>
       </table>
-      <div class="doc-totals">
-        <div class="trow"><span>SUBTOTAL</span><span>R ${fmtMoney(doc.subtotal)}</span></div>
-        <div class="trow"><span>TAX</span><span>R ${fmtMoney(doc.taxTotal)}</span></div>
-        <div class="trow total"><span>TOTAL</span><span>R ${fmtMoney(doc.total)}</span></div>
+      <div class="doc-bottom">
+        ${(doc.specialNotes || '').trim() ? `<div class="doc-special"><div class="doc-special-heading">SPECIAL NOTES</div><div class="doc-special-text">${esc(doc.specialNotes.trim())}</div></div>` : ''}
+        <div class="doc-totals">
+          <div class="trow"><span>SUBTOTAL</span><span>R ${fmtMoney(doc.subtotal)}</span></div>
+          <div class="trow"><span>TAX</span><span>R ${fmtMoney(doc.taxTotal)}</span></div>
+          <div class="trow total"><span>TOTAL</span><span>R ${fmtMoney(doc.total)}</span></div>
+        </div>
       </div>
       <div class="doc-banking-heading">BANKING DETAILS</div>
       <div class="doc-banking">
