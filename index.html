@@ -99,6 +99,7 @@
   table.statement-ageing th{text-align:right!important;}
   button.is-busy{opacity:.55;cursor:progress;}
   body.app-busy{cursor:progress;}
+  .pill.credited{background:#ede9fe;color:#5b21b6;}
   .pill.approved{background:#dcfce7;color:#166534;}
   .pill.awaiting{background:#fef3c7;color:#92400e;}
   .doc-totals{max-width:340px;margin-left:auto;font-size:13px;}
@@ -281,6 +282,8 @@ const ROLE_TABS = { stock_controller: ['items', 'receipts', 'assets'] };
 function tabAllowed(id) {
   if (ROLE_TABS[CURRENT_ROLE]) return ROLE_TABS[CURRENT_ROLE].includes(id);
   if (id === 'receipts') return canManageStock();
+  if (id === 'settings') return canEditSettings();
+  if (id === 'assets') return CURRENT_ROLE !== 'no_stock';
   if (id === 'export') return canExportQBO();
   return true;
 }
@@ -357,7 +360,7 @@ function mapItemToDb(it) {
 function mapDocFromDb(r) {
   return { id: r.id, type: r.type, number: r.number, status: r.status, customer: r.customer_snapshot,
     truckReg: r.truck_reg || '', reg6m: r.reg_6m || '', reg12m: r.reg_12m || '', customerDepo: r.customer_depo || '',
-    poNumber: r.po_number || '', jobcard: r.jobcard || '', tec: r.tec || '', hkm: r.hkm || '', quoteRef: r.quote_ref || '', specialNotes: r.special_notes || '',
+    poNumber: r.po_number || '', jobcard: r.jobcard || '', tec: r.tec || '', hkm: r.hkm || '', quoteRef: r.quote_ref || '', specialNotes: r.special_notes || '', creditFor: r.credit_for || '', creditReason: r.credit_reason || '', stockReturned: !!r.stock_returned,
     issueDate: r.issue_date || '', dueDate: r.due_date || '', items: r.items || [],
     subtotal: Number(r.subtotal) || 0, taxTotal: Number(r.tax_total) || 0, total: Number(r.total) || 0,
     exportedToQBO: r.exported_to_qbo, stockDeducted: !!r.stock_deducted, createdAt: r.created_at, updatedAt: r.updated_at,
@@ -375,7 +378,7 @@ function mapDocToDb(d, isInsert) {
 function mapDocFieldsToDb(d) {
   return { type: d.type, number: d.number, status: d.status, customer_num: d.customer.num, customer_snapshot: d.customer,
     truck_reg: d.truckReg, reg_6m: d.reg6m, reg_12m: d.reg12m, customer_depo: d.customerDepo, po_number: d.poNumber,
-    jobcard: d.jobcard, tec: d.tec, hkm: d.hkm, quote_ref: d.quoteRef, special_notes: (d.specialNotes || '').trim() || null,
+    jobcard: d.jobcard, tec: d.tec, hkm: d.hkm, quote_ref: d.quoteRef, special_notes: (d.specialNotes || '').trim() || null, credit_for: d.creditFor || null, credit_reason: d.creditReason || null, stock_returned: !!d.stockReturned,
     issue_date: d.issueDate || null, due_date: d.dueDate || null,
     items: d.items, subtotal: d.subtotal, tax_total: d.taxTotal, total: d.total,
     exported_to_qbo: !!d.exportedToQBO, stock_deducted: !!d.stockDeducted };
@@ -476,14 +479,15 @@ async function createItemRecord(fields) {
   if (numErr) { alert('Could not assign an item code — ' + numErr.message); return null; }
   const code = `ITM-${String(numData).padStart(4, '0')}`;
   const item = { code, isNew: true, stockQty: null, ...fields };
+  const startQty = (item.stockQty === null || item.stockQty === undefined || item.stockQty === '') ? null : Number(item.stockQty);
+  item.stockQty = null;
   const { data: insRow, error: insErr } = await supabaseClient.from('items').insert(mapItemToDb(item)).select('id, created_at').single();
   if (insErr) { alert('Could not save this item — ' + insErr.message); return null; }
   item.id = insRow.id; item.createdAt = insRow.created_at;
-  if (item.stockQty !== null) {
-    await supabaseClient.from('stock_movements').insert({
-      item_code: code, movement_type: 'initial_count', qty_change: item.stockQty, qty_before: 0, qty_after: item.stockQty,
-      created_by: CURRENT_USER ? CURRENT_USER.id : null, created_by_email: CURRENT_USER ? CURRENT_USER.email : null,
-    });
+  if (startQty !== null) {
+    const { data: setQty, error: setErr } = await supabaseClient.rpc('set_initial_stock', { p_code: code, p_qty: startQty });
+    if (setErr) alert(`The item was added, but its starting count could not be set — ${setErr.message}. Use "Set" on the Items tab.`);
+    else item.stockQty = setQty === null ? null : Number(setQty);
   }
   putRow(STATE.items, 'code', item);
   STATE.counters.itemCode = numData;
@@ -611,6 +615,95 @@ function askDeclineOutcome(doc) {
 // Declined + parts used: stock stays off and the quote keeps its hold
 // (stock_deducted stays true) so a later conversion won't deduct twice and
 // deleting it won't put stock back. Declined + parts returned: stock goes back.
+// Credit an invoice in full or in part. Issued credit notes are final.
+function openCreditModal(inv) {
+  return new Promise(resolve => {
+    if (!canIssueCredits() || inv.type !== 'invoice') return resolve(false);
+    const already = {};
+    creditsFor(inv).forEach(cn => (cn.items || []).forEach(li => {
+      if (li.srcIndex !== undefined) already[li.srcIndex] = (already[li.srcIndex] || 0) + (Number(li.qty) || 0);
+    }));
+    const lines = (inv.items || []).map((li, i) => ({ li, i, remaining: Math.max(0, (Number(li.qty) || 0) - (already[i] || 0)) }));
+    const hasTracked = lines.some(x => STATE.items.some(it => it.code === x.li.code && it.stockQty !== null));
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `
+      <div id="creditModal" class="no-print" style="position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:100;overflow:auto;padding:24px;">
+        <div style="max-width:760px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden;">
+          <div style="padding:12px 20px;background:var(--ink);color:#fff;"><b>Credit Invoice ${esc(inv.number)}</b> — ${esc(inv.customer.name)}</div>
+          <div style="padding:20px;">
+            <p class="note" style="margin-top:0;">Credit the whole invoice, or lower the quantities to credit part of it. Already credited: R ${fmtMoney(creditedTotal(inv))} of R ${fmtMoney(inv.total)}.</p>
+            <table class="data"><thead><tr><th>Item</th><th>Invoiced</th><th>Credited</th><th>Credit now</th><th>Rate</th></tr></thead><tbody>
+              ${lines.map(x => `<tr>
+                <td>${esc(x.li.desc)}${x.li.notes ? `<div class="note">${esc(x.li.notes)}</div>` : ''}</td>
+                <td>${esc(x.li.qty)}</td><td>${already[x.i] || 0}</td>
+                <td><input type="number" class="cr-qty" data-i="${x.i}" min="0" max="${x.remaining}" step="any" value="${x.remaining}" style="width:80px;" ${x.remaining <= 0 ? 'disabled' : ''}></td>
+                <td>R ${fmtMoney(x.li.rate)}</td></tr>`).join('')}
+            </tbody></table>
+            <div class="row" style="margin-top:12px;">
+              <div class="col"><div class="field"><label>Credit note date</label><input type="date" id="crDate" value="${todayISO()}"></div></div>
+            </div>
+            <div class="field"><label>Reason *</label><textarea id="crReason" rows="2" style="width:100%;" placeholder="e.g. Part returned unused; price corrected"></textarea></div>
+            ${hasTracked ? `<div class="field"><label>Were the parts on this credit returned to stock? *</label>
+              <label style="font-weight:400;"><input type="radio" name="crStock" value="no"> No — parts stay with the customer (stock unchanged)</label><br>
+              <label style="font-weight:400;"><input type="radio" name="crStock" value="yes"> Yes — parts came back to the shelf (put stock back)</label></div>` : ''}
+            <div id="crTotal" style="font-weight:700;margin:10px 0;"></div>
+            <button class="btn accent small" id="crSaveBtn">Issue Credit Note</button>
+            <button class="btn ghost small" id="crCancelBtn">Cancel</button>
+          </div>
+        </div>
+      </div>`;
+    document.body.appendChild(wrap);
+    const close = val => { wrap.remove(); resolve(val); };
+    const buildDraft = () => {
+      const items = [];
+      wrap.querySelectorAll('.cr-qty').forEach(inp => {
+        const q = Number(inp.value);
+        if (!(q > 0)) return;
+        const src = inv.items[Number(inp.dataset.i)];
+        items.push({ code: src.code, desc: src.desc, notes: src.notes || '', qty: q, rate: src.rate, vat: src.vat, srcIndex: Number(inp.dataset.i) });
+      });
+      const draft = { type: 'credit', status: 'Issued', customer: inv.customer, creditFor: inv.number, items,
+        issueDate: document.getElementById('crDate').value || todayISO(), dueDate: '',
+        poNumber: inv.poNumber, truckReg: inv.truckReg, reg6m: inv.reg6m, reg12m: inv.reg12m, customerDepo: inv.customerDepo,
+        jobcard: inv.jobcard, tec: inv.tec, hkm: inv.hkm, quoteRef: inv.quoteRef, specialNotes: '', stockDeducted: false };
+      computeTotals(draft);
+      return draft;
+    };
+    const showTotal = () => { document.getElementById('crTotal').textContent = `Credit note total: R ${fmtMoney(buildDraft().total)}`; };
+    wrap.querySelectorAll('.cr-qty').forEach(inp => { inp.oninput = showTotal; });
+    showTotal();
+    document.getElementById('crCancelBtn').onclick = () => close(false);
+    document.getElementById('crSaveBtn').onclick = async () => {
+      for (const inp of wrap.querySelectorAll('.cr-qty')) {
+        const q = Number(inp.value), max = Number(inp.max);
+        if (inp.value !== '' && (isNaN(q) || q < 0 || q > max + 1e-9)) { alert(`Credit quantities must be between 0 and what is left to credit (${max}).`); return; }
+      }
+      const draft = buildDraft();
+      if (!draft.items.length || !(draft.total > 0)) { alert('Enter a quantity to credit on at least one line.'); return; }
+      const reason = document.getElementById('crReason').value.trim();
+      if (!reason) { alert('Please give a reason for the credit note.'); return; }
+      let stockReturned = false;
+      if (hasTracked) {
+        const pick = wrap.querySelector('input[name="crStock"]:checked');
+        if (!pick) { alert('Please say whether the parts were returned to stock.'); return; }
+        stockReturned = pick.value === 'yes';
+      }
+      if (!confirm(`Issue a credit note for R ${fmtMoney(draft.total)} against Invoice ${inv.number}? Credit notes cannot be changed or deleted afterwards.`)) return;
+      const { data: num, error: numErr } = await supabaseClient.rpc('next_credit_number');
+      if (numErr) { alert('Could not assign a credit note number — ' + numErr.message); return; }
+      draft.number = 'CN-' + String(num).padStart(4, '0');
+      draft.creditReason = reason;
+      draft.stockReturned = stockReturned;
+      const { data: row, error } = await supabaseClient.from('documents').insert(mapDocToDb(draft, true)).select().single();
+      if (error) { alert('Could not issue the credit note — ' + error.message); return; }
+      const cn = mapDocFromDb(row);
+      putRow(STATE.documents, 'id', cn, true);
+      close(true);
+      openPrintPreview(cn);
+    };
+  });
+}
+
 async function declineQuote(doc) {
   const outcome = await askDeclineOutcome(doc);
   if (!outcome) return false;
@@ -619,16 +712,7 @@ async function declineQuote(doc) {
   const { error } = await supabaseClient.from('documents')
     .update({ status: 'Declined', stock_deducted: returned ? false : !!doc.stockDeducted, updated_at: nowIso }).eq('id', doc.id);
   if (error) { alert('Could not decline — ' + error.message); return false; }
-  if (returned) {
-    await adjustStockForDoc(doc, 1);
-    doc.stockDeducted = false;
-  } else if (doc.stockDeducted) {
-    // History note only — no quantity change.
-    await moveStockBatch(Object.keys(trackedQtyByCode(doc.items)).map(code => ({
-      code, delta: 0, type: 'quote_used', reference: `Quote ${doc.number}`,
-      notes: 'Quote declined — parts used on the job, not returned to stock',
-    })));
-  }
+  if (returned) doc.stockDeducted = false;   // stock goes back (done by the database)
   doc.status = 'Declined';
   doc.updatedAt = nowIso;
   return true;
@@ -722,8 +806,9 @@ function dashboardFilteredDocs() {
   return docs.filter(d => {
     if (dashFilter === 'quotes' && d.type !== 'quote') return false;
     if (dashFilter === 'invoices' && d.type !== 'invoice') return false;
+    if (dashFilter === 'credits' && d.type !== 'credit') return false;
     if (dashFilter === 'awaiting' && !quoteNeedsApproval(d)) return false;
-    if (!['all', 'quotes', 'invoices', 'awaiting'].includes(dashFilter) && d.status !== dashFilter) return false;
+    if (!['all', 'quotes', 'invoices', 'credits', 'awaiting'].includes(dashFilter) && d.status !== dashFilter) return false;
     if (dashSearch) {
       const s = dashSearch.toLowerCase();
       const hay = `${d.number} ${d.customer.name} ${d.truckReg}`.toLowerCase();
@@ -737,22 +822,45 @@ function dashboardRowsHtml(filtered) {
   return filtered.map(d => `
     <tr>
       <td data-label="Number"><b>${esc(d.number)}</b></td>
-      <td data-label="Type">${d.type === 'quote' ? 'Quote' : 'Invoice'}</td>
+      <td data-label="Type">${docTypeLabel(d)}</td>
       <td data-label="Customer"><a href="#" data-cust="${esc(d.customer.num)}" class="cust-link">${esc(d.customer.name)}</a></td>
       <td data-label="Truck Reg">${esc(d.truckReg)}</td>
       <td data-label="Total">R ${fmtMoney(d.total)}</td>
-      <td data-label="Status"><span class="pill ${d.status.toLowerCase()}">${d.status}</span>${approvalBadge(d)}</td>
+      <td data-label="Status">${docStatusHtml(d)}</td>
       <td data-label="Date">${fmtDate(d.issueDate)}</td>
       <td style="white-space:nowrap;">
-        ${approveButtonHtml(d)}
-        <button class="btn ghost small" data-act="view" data-id="${d.id}">View</button>
-        <button class="btn ghost small" data-act="edit" data-id="${d.id}">Edit</button>
-        ${d.type === 'quote' && d.status !== 'Converted' ? `<button class="btn accent small" data-act="convert" data-id="${d.id}">Convert to Invoice</button>` : ''}
-        ${d.type === 'quote' && d.status !== 'Converted' && d.status !== 'Declined' ? `<button class="btn ghost small" data-act="decline" data-id="${d.id}">Decline</button>` : ''}
-        ${d.type === 'invoice' && d.status !== 'Paid' ? `<button class="btn small" data-act="paid" data-id="${d.id}">Mark Paid</button>` : ''}
-        <button class="btn danger small" data-act="delete" data-id="${d.id}">Delete</button>
+        ${docActionsHtml(d)}
       </td>
     </tr>`).join('') || `<tr><td colspan="8" style="text-align:center;color:var(--steel);padding:24px;">No documents yet. Create your first quote above.</td></tr>`;
+}
+
+// Jacobus, Lizette and the administrator issue credit notes and edit settings.
+function canIssueCredits() { return !['no_stock', 'stock_controller'].includes(CURRENT_ROLE); }
+function canEditSettings() { return !['no_stock', 'stock_controller'].includes(CURRENT_ROLE); }
+function docTypeLabel(d) { return d.type === 'quote' ? 'Quote' : d.type === 'credit' ? 'Credit Note' : 'Invoice'; }
+function creditsFor(inv) {
+  return inv && inv.type === 'invoice' ? STATE.documents.filter(x => x.type === 'credit' && String(x.creditFor) === String(inv.number)) : [];
+}
+function creditedTotal(inv) { return creditsFor(inv).reduce((sum, c) => sum + (Number(c.total) || 0), 0); }
+function invoiceNet(inv) { return Math.max(0, (Number(inv.total) || 0) - creditedTotal(inv)); }
+function fullyCredited(inv) { return inv.type === 'invoice' && creditsFor(inv).length > 0 && invoiceNet(inv) < 0.005; }
+function docStatusHtml(d) {
+  if (d.type === 'credit') return `<span class="pill credited">Credit</span>`;
+  if (fullyCredited(d)) return `<span class="pill credited">Credited</span>`;
+  const part = d.type === 'invoice' && creditsFor(d).length ? ` <span class="pill credited" title="Credited R ${fmtMoney(creditedTotal(d))}">Part credited</span>` : '';
+  return `<span class="pill ${d.status.toLowerCase()}">${d.status}</span>${part}${approvalBadge(d)}`;
+}
+function docActionsHtml(d) {
+  if (d.type === 'credit') return `<button class="btn ghost small" data-act="view" data-id="${d.id}">View</button>`;
+  const locked = d.type === 'invoice' && creditsFor(d).length > 0;   // credited invoices are final
+  return `${approveButtonHtml(d)}
+        <button class="btn ghost small" data-act="view" data-id="${d.id}">View</button>
+        ${!locked ? `<button class="btn ghost small" data-act="edit" data-id="${d.id}">Edit</button>` : ''}
+        ${d.type === 'quote' && d.status !== 'Converted' ? `<button class="btn accent small" data-act="convert" data-id="${d.id}">Convert to Invoice</button>` : ''}
+        ${d.type === 'quote' && d.status !== 'Converted' && d.status !== 'Declined' ? `<button class="btn ghost small" data-act="decline" data-id="${d.id}">Decline</button>` : ''}
+        ${d.type === 'invoice' && d.status !== 'Paid' && !fullyCredited(d) ? `<button class="btn small" data-act="paid" data-id="${d.id}">Mark Paid</button>` : ''}
+        ${d.type === 'invoice' && canIssueCredits() && !fullyCredited(d) ? `<button class="btn ghost small" data-act="credit" data-id="${d.id}">Credit</button>` : ''}
+        ${d.type === 'quote' ? `<button class="btn danger small" data-act="delete" data-id="${d.id}">Delete</button>` : ''}`;
 }
 
 function linkedQuoteFor(inv) {
@@ -797,6 +905,7 @@ function wireDashboardRowActions(tbody) {
       if (btn.dataset.act === 'convert') { await convertQuoteToInvoice(doc); }
       if (btn.dataset.act === 'decline') { if (await declineQuote(doc)) refreshDashboardBody(); }
       if (btn.dataset.act === 'approve') { if (await approveQuote(doc)) refreshDashboardBody(); }
+      if (btn.dataset.act === 'credit') { if (await openCreditModal(doc)) refreshDashboardBody(); }
       if (btn.dataset.act === 'paid') {
         doc.status = 'Paid'; doc.updatedAt = new Date().toISOString();
         const { error } = await supabaseClient.from('documents').update({ status: 'Paid', updated_at: doc.updatedAt }).eq('id', id);
@@ -807,7 +916,6 @@ function wireDashboardRowActions(tbody) {
         if (confirm(`Delete ${doc.number}? This cannot be undone.`)) {
           const { error } = await supabaseClient.from('documents').delete().eq('id', id);
           if (error) { alert('Could not delete — ' + error.message); return; }
-          if (doc.stockDeducted && doc.status !== 'Declined') await adjustStockForDoc(doc, 1);
           STATE.documents = STATE.documents.filter(x => x.id !== id);
           refreshDashboardBody();
         }
@@ -847,7 +955,7 @@ function renderDashboard(c) {
     <div class="card">
       <div class="toolbar">
         <div style="display:flex;gap:6px;flex-wrap:wrap;" id="dashChips">
-          ${['all','quotes','invoices','awaiting','Draft','Sent','Accepted','Converted','Declined','Paid','Overdue'].map(f =>
+          ${['all','quotes','invoices','credits','awaiting','Draft','Sent','Accepted','Converted','Declined','Paid','Overdue'].map(f =>
             `<span class="chip ${dashFilter===f?'active':''}" data-f="${f}">${f === 'awaiting' ? `Awaiting approval (${STATE.documents.filter(quoteNeedsApproval).length})` : f[0].toUpperCase()+f.slice(1)}</span>`
           ).join('')}
         </div>
@@ -880,41 +988,18 @@ function loadDocIntoBuilder(doc) {
 }
 
 async function convertQuoteToInvoice(quote) {
-  // Warn before an invoice number is taken, so cancelling leaves no gap.
+  // Warn before converting an older quote that never took its stock.
   if (!quote.stockDeducted && !confirmStockShortfall(negate(trackedQtyByCode(quote.items)), 'this invoice')) return;
-  const { data: numData, error: numErr } = await supabaseClient.rpc('next_invoice_number');
-  if (numErr) { alert(`Could not assign an invoice number — ${numErr.message}`); return; }
-  const inv = JSON.parse(JSON.stringify(quote));
-  delete inv.id;
-  inv.type = 'invoice';
-  inv.number = String(numData);
-  inv.status = 'Draft';
-  inv.issueDate = todayISO();
-  inv.dueDate = addDays(inv.issueDate, 30);
-  inv.quoteRef = quote.number;
-  inv.exportedToQBO = false;
-  // If the quote already took the stock, the hold moves to the invoice.
-  // Older quotes (saved before stock came off at quote stage), and quotes
-  // declined with parts returned to stock, hold nothing, so those deduct now.
-  const quoteHeldStock = !!quote.stockDeducted;
-  if (!quoteHeldStock) await adjustStockForDoc(inv, -1);
-  inv.stockDeducted = true;
-
-  const { data: insData, error: insErr } = await supabaseClient.from('documents').insert(mapDocToDb(inv, true)).select().single();
-  if (insErr) {
-    if (!quoteHeldStock) await adjustStockForDoc(inv, 1);
-    alert(`Could not create the invoice — ${insErr.message}`); return;
-  }
-  inv.id = insData.id;
-  inv.createdAt = insData.created_at;
-  inv.updatedAt = insData.updated_at;
-  STATE.counters.invoiceNum = numData;
-
-  const { error: updErr } = await supabaseClient.from('documents').update({ status: 'Converted', stock_deducted: false }).eq('id', quote.id);
-  if (updErr) { alert(`Invoice was created, but could not mark the quote as converted — ${updErr.message}. Please check this quote before deleting or declining it.`); }
-  else { quote.status = 'Converted'; quote.stockDeducted = false; quote.updatedAt = new Date().toISOString(); }
-
+  const today = todayISO();
+  const { data, error } = await supabaseClient.rpc('convert_quote', {
+    p_quote_id: quote.id,
+    p_invoice: { issue_date: today, due_date: addDays(today, 30) },
+  });
+  if (error) { alert(`Could not create the invoice — ${error.message}`); return; }
+  const inv = mapDocFromDb(data);
+  quote.status = 'Converted'; quote.stockDeducted = false; quote.updatedAt = new Date().toISOString();
   putRow(STATE.documents, 'id', inv, true);
+  if (data.invoice_num) STATE.counters.invoiceNum = data.invoice_num;
   loadDocIntoBuilder(inv);
 }
 
@@ -930,7 +1015,7 @@ function renderCustomerSummary(c, customerNum) {
     .sort((a, b) => (b.issueDate || '').localeCompare(a.issueDate || ''));
   setTimeout(() => { const sb = document.getElementById('statementBtn'); if (sb) sb.onclick = () => openStatement(cust); }, 0);
   const totalInvoiced = docs.filter(d => d.type === 'invoice').reduce((s, d) => s + (d.total || 0), 0);
-  const totalOutstanding = docs.filter(d => d.type === 'invoice' && d.status !== 'Paid').reduce((s, d) => s + (d.total || 0), 0);
+  const totalOutstanding = docs.filter(d => d.type === 'invoice' && d.status !== 'Paid').reduce((s, d) => s + invoiceNet(d), 0);
   const totalQuoted = docs.filter(d => d.type === 'quote').reduce((s, d) => s + (d.total || 0), 0);
 
   c.innerHTML = `
@@ -966,19 +1051,13 @@ function renderCustomerSummary(c, customerNum) {
           ${docs.map(d => `
             <tr>
               <td data-label="Number"><b>${esc(d.number)}</b></td>
-              <td data-label="Type">${d.type === 'quote' ? 'Quote' : 'Invoice'}</td>
+              <td data-label="Type">${docTypeLabel(d)}</td>
               <td data-label="Truck Reg">${esc(d.truckReg)}</td>
               <td data-label="Total">R ${fmtMoney(d.total)}</td>
-              <td data-label="Status"><span class="pill ${d.status.toLowerCase()}">${d.status}</span>${approvalBadge(d)}</td>
+              <td data-label="Status">${docStatusHtml(d)}</td>
               <td data-label="Date">${fmtDate(d.issueDate)}</td>
               <td style="white-space:nowrap;">
-                ${approveButtonHtml(d)}
-        <button class="btn ghost small" data-act="view" data-id="${d.id}">View</button>
-                <button class="btn ghost small" data-act="edit" data-id="${d.id}">Edit</button>
-                ${d.type === 'quote' && d.status !== 'Converted' ? `<button class="btn accent small" data-act="convert" data-id="${d.id}">Convert to Invoice</button>` : ''}
-        ${d.type === 'quote' && d.status !== 'Converted' && d.status !== 'Declined' ? `<button class="btn ghost small" data-act="decline" data-id="${d.id}">Decline</button>` : ''}
-                ${d.type === 'invoice' && d.status !== 'Paid' ? `<button class="btn small" data-act="paid" data-id="${d.id}">Mark Paid</button>` : ''}
-                <button class="btn danger small" data-act="delete" data-id="${d.id}">Delete</button>
+                ${docActionsHtml(d)}
               </td>
             </tr>`).join('') || `<tr><td colspan="7" style="text-align:center;color:var(--steel);padding:24px;">No quotes or invoices for this customer yet.</td></tr>`}
         </tbody>
@@ -1030,6 +1109,7 @@ function renderCustomerSummary(c, customerNum) {
       if (btn.dataset.act === 'convert') { await convertQuoteToInvoice(doc); }
       if (btn.dataset.act === 'decline') { if (await declineQuote(doc)) renderCustomerSummary(c, customerNum); }
       if (btn.dataset.act === 'approve') { if (await approveQuote(doc)) renderCustomerSummary(c, customerNum); }
+      if (btn.dataset.act === 'credit') { if (await openCreditModal(doc)) renderCustomerSummary(c, customerNum); }
       if (btn.dataset.act === 'paid') {
         doc.status = 'Paid'; doc.updatedAt = new Date().toISOString();
         const { error } = await supabaseClient.from('documents').update({ status: 'Paid', updated_at: doc.updatedAt }).eq('id', id);
@@ -1040,7 +1120,6 @@ function renderCustomerSummary(c, customerNum) {
         if (confirm(`Delete ${doc.number}? This cannot be undone.`)) {
           const { error } = await supabaseClient.from('documents').delete().eq('id', id);
           if (error) { alert('Could not delete — ' + error.message); return; }
-          if (doc.stockDeducted && doc.status !== 'Declined') await adjustStockForDoc(doc, 1);
           STATE.documents = STATE.documents.filter(x => x.id !== id);
           renderCustomerSummary(c, customerNum);
         }
@@ -1397,17 +1476,9 @@ async function saveDocumentInner(type, preview) {
       STATE.counters[type === 'quote' ? 'quoteNum' : 'invoiceNum'] = numData;
     }
     d.status = d.status || 'Draft';
-    let deductedNow = false;
-    if (!d.stockDeducted) {
-      await adjustStockForDoc(d, -1);
-      d.stockDeducted = true;
-      deductedNow = true;
-    }
+    d.stockDeducted = true;   // the database takes the stock off as it saves
     const { data: insData, error: insErr } = await supabaseClient.from('documents').insert(mapDocToDb(d, true)).select().single();
-    if (insErr) {
-      if (deductedNow) { await adjustStockForDoc(d, 1); d.stockDeducted = false; }
-      alert(`Could not save this ${type} — ${insErr.message}`); return;
-    }
+    if (insErr) { d.stockDeducted = false; alert(`Could not save this ${type} — ${insErr.message}`); return; }
     d.id = insData.id;
     d.createdAt = insData.created_at;
     d.updatedAt = insData.updated_at;
@@ -1423,7 +1494,6 @@ async function saveDocumentInner(type, preview) {
     if (updRow) { d.approvedAt = updRow.approved_at || null; d.approvedBy = updRow.approved_by_email || ''; }
     // Only documents currently holding stock adjust on edit (not declined,
     // converted, or older quotes that never took stock).
-    if (original.stockDeducted && d.stockDeducted) await adjustStockForEdit(original, d);
     STATE.documents[existingIdx] = d;
     // The database copies a quote's new PO number onto its invoice (if that
     // invoice's PO was blank or still the old one). Mirror it here.
@@ -1467,7 +1537,11 @@ function docHeaderHtml(co) {
 function openPrintPreview(doc) {
   const co = STATE.company;
   const isInvoice = doc.type === 'invoice';
-  const detailRows = isInvoice ? [
+  const isCredit = doc.type === 'credit';
+  const detailRows = isCredit ? [
+    ['Credit Note No.', doc.number], ['Date', fmtDate(doc.issueDate)], ['Invoice No.', doc.creditFor],
+    ['Reason', doc.creditReason], ['PO Number', doc.poNumber], ['Truck Registration Number', doc.truckReg],
+  ] : isInvoice ? [
     ['Invoice No.', doc.number], ['Date', fmtDate(doc.issueDate)], ['Quote No.', doc.quoteRef || '—'],
     ['Truck Registration Number', doc.truckReg], ['Reg. 6m', doc.reg6m], ['Reg. 12m', doc.reg12m],
     ['Customer Depo', doc.customerDepo], ['PO Number', doc.poNumber], ['Jobcard', doc.jobcard], ['Tec', doc.tec], ['HKM', doc.hkm],
@@ -1498,7 +1572,7 @@ function openPrintPreview(doc) {
   const html = `
     <div class="doc-page">
       ${docHeaderHtml(co)}
-      <div class="doc-title">${isInvoice ? 'INVOICE' : 'QUOTE'}</div>
+      <div class="doc-title">${isCredit ? 'CREDIT NOTE' : isInvoice ? 'INVOICE' : 'QUOTE'}</div>
       <div class="doc-twocol">
         <div class="doc-billto">
           <div style="font-weight:700;color:var(--steel);font-size:11px;">BILL TO</div>
@@ -1524,12 +1598,13 @@ function openPrintPreview(doc) {
           <div class="trow total"><span>TOTAL</span><span>R ${fmtMoney(doc.total)}</span></div>
         </div>
       </div>
+      ${isCredit ? `<div class="doc-footnote">This credit note reduces the amount owing on Invoice ${esc(doc.creditFor)} by R ${fmtMoney(doc.total)} (incl. VAT).</div>` : `
       <div class="doc-banking-heading">BANKING DETAILS</div>
       <div class="doc-banking">
         <div><b>ABSA</b>Cheque account<br>Account number: ${esc(co.absaAcc)}<br>Branch code: ${esc(co.absaBranch)}</div>
         <div><b>FNB</b>Cheque account<br>Account number: ${esc(co.fnbAcc)}<br>Branch code: ${esc(co.fnbBranch)}</div>
       </div>
-      ${footer}
+      ${footer}`}
     </div>
   `;
   // Paula/Adele can't print or send a quote until Jacobus/Lizette approve it.
@@ -1543,11 +1618,11 @@ function openPrintPreview(doc) {
     <div id="previewModal" style="position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:100;overflow:auto;padding:24px;" class="no-print">
       <div style="max-width:900px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden;">
         <div style="padding:12px 20px;background:var(--ink);color:#fff;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-          <b>${isInvoice ? 'Invoice' : 'Quote'} ${esc(doc.number)} — Preview</b>
+          <b>${docTypeLabel(doc)} ${esc(doc.number)} — Preview</b>
           <div>
             ${canApproveQuotes() && quoteNeedsApproval(doc) ? `<button class="btn small" id="doApproveBtn" style="background:#166534;color:#fff;">Approve Quote</button>` : ''}
             <button class="btn accent small" id="doPrintBtn" ${blocked ? 'disabled title="Waiting for approval"' : ''}>Print / Save as PDF</button>
-            <button class="btn small" id="doEmailBtn" style="background:#3b5a8c;" ${blocked ? 'disabled title="Waiting for approval"' : ''}>Email ${isInvoice ? 'Invoice' : 'Quote'}</button>
+            <button class="btn small" id="doEmailBtn" style="background:#3b5a8c;" ${blocked ? 'disabled title="Waiting for approval"' : ''}>Email ${docTypeLabel(doc)}</button>
             <button class="btn ghost small" id="closePreviewBtn" style="background:#fff;">Close</button>
           </div>
         </div>
@@ -1585,13 +1660,20 @@ function buildStatement(cust, asAt) {
     .sort((a, b) => (a.issueDate || '').localeCompare(b.issueDate || '') || String(a.number).localeCompare(String(b.number)));
   const ageing = { current: 0, d30: 0, d60: 0, d90: 0 };
   let running = 0;
-  const rows = open.map(d => {
-    const amt = Number(d.total) || 0;
-    running += amt;
+  const rows = [];
+  for (const d of open) {
+    const credits = creditsFor(d).filter(cn => (cn.issueDate || '') <= asAt);
+    const net = (Number(d.total) || 0) - credits.reduce((sum, cn) => sum + (Number(cn.total) || 0), 0);
+    if (net < 0.005) continue;   // fully credited: nothing owing
+    running += Number(d.total) || 0;
+    rows.push({ d, amt: Number(d.total) || 0, running, label: `Invoice ${d.number}` });
+    for (const cn of credits) {
+      running -= Number(cn.total) || 0;
+      rows.push({ d: cn, amt: -(Number(cn.total) || 0), running, label: `Credit note ${cn.number} (Invoice ${d.number})`, credit: true });
+    }
     const age = daysBetween(d.issueDate, asAt);
-    if (age <= 30) ageing.current += amt; else if (age <= 60) ageing.d30 += amt; else if (age <= 90) ageing.d60 += amt; else ageing.d90 += amt;
-    return { d, amt, running };
-  });
+    if (age <= 30) ageing.current += net; else if (age <= 60) ageing.d30 += net; else if (age <= 90) ageing.d60 += net; else ageing.d90 += net;
+  }
   return { open, rows, ageing, total: running };
 }
 function statementHtml(cust, asAt) {
@@ -1600,10 +1682,10 @@ function statementHtml(cust, asAt) {
   const rowsHtml = st.rows.map(r => `
     <tr>
       <td>${fmtDate(r.d.issueDate)}</td>
-      <td>Invoice ${esc(r.d.number)}</td>
+      <td>${esc(r.label)}</td>
       <td>${esc(r.d.poNumber) || '—'}</td>
       <td>${esc(r.d.truckReg) || '—'}</td>
-      <td>${fmtDate(r.d.dueDate)}</td>
+      <td>${r.credit ? '—' : fmtDate(r.d.dueDate)}</td>
       <td style="text-align:right;">R ${fmtMoney(r.amt)}</td>
       <td style="text-align:right;">R ${fmtMoney(r.running)}</td>
     </tr>`).join('') || `<tr><td colspan="7" style="text-align:center;color:var(--steel);padding:16px;">No outstanding invoices as at ${fmtDate(asAt)}.</td></tr>`;
@@ -1709,7 +1791,9 @@ function buildEmailBody(doc, co, isInvoice) {
   const greetName = doc.customer.contact || doc.customer.name;
   const totalStr = 'R ' + fmtMoney(doc.total);
   const lines = [`Dear ${greetName},`, ''];
-  if (isInvoice) {
+  if (doc.type === 'credit') {
+    lines.push(`Please find attached Credit Note ${doc.number} for ${totalStr} (incl. VAT) against Invoice ${doc.creditFor}.`);
+  } else if (isInvoice) {
     lines.push(`Please find attached Invoice ${doc.number} for ${totalStr} (incl. VAT), due by ${fmtDate(doc.dueDate)}.`);
     lines.push('');
     lines.push('Banking details are included on the invoice — please use the invoice number as your payment reference.');
@@ -1730,7 +1814,7 @@ function emailDocument(doc) {
     alert(`${doc.customer.name} has no email address on file. Add one in the Customers tab, then try again.`);
     return;
   }
-  const subject = `${isInvoice ? 'Invoice' : 'Quote'} ${doc.number} — ${co.name}`;
+  const subject = `${docTypeLabel(doc)} ${doc.number} — ${co.name}`;
   const body = buildEmailBody(doc, co, isInvoice);
   alert('Your email app will now open with the message ready. This tool can\'t attach the PDF automatically — use "Print / Save as PDF" first (if you haven\'t already) and attach the saved file before sending.');
   const mailto = `mailto:${encodeURIComponent(email)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
@@ -2038,7 +2122,7 @@ async function openStockHistoryModal(code) {
   const item = STATE.items.find(x => x.code === code);
   if (!item) return;
   const { data, error } = await supabaseClient.from('stock_movements').select('*').eq('item_code', code).order('created_at', { ascending: false });
-  const typeLabel = { initial_count: 'Initial count', correction: 'Correction', receipt: 'Stock receipt', invoice_deduct: 'Invoice', invoice_restore: 'Invoice deleted', invoice_edit: 'Invoice edited', quote_deduct: 'Quote', quote_restore: 'Quote declined/deleted (returned)', quote_edit: 'Quote edited', quote_used: 'Quote declined (parts used)' };
+  const typeLabel = { initial_count: 'Initial count', correction: 'Correction', receipt: 'Stock receipt', invoice_deduct: 'Invoice', invoice_restore: 'Invoice deleted', invoice_edit: 'Invoice edited', quote_deduct: 'Quote', quote_restore: 'Quote declined/deleted (returned)', quote_edit: 'Quote edited', quote_used: 'Quote declined (parts used)', quote_convert: 'Quote converted to invoice', credit_return: 'Credit note (returned to stock)' };
   const rows = error
     ? `<tr><td colspan="7" style="color:var(--danger);">Could not load history — ${esc(error.message)}</td></tr>`
     : (data && data.length ? data.map(m => `
@@ -2324,7 +2408,8 @@ async function renderAssets(c) {
 function renderAssetsList(c) {
   const assets = window.__ASSETS_CACHE__ || [];
   const filtered = assets.filter(a => {
-    if (assetStatusFilter !== 'all' && a.status !== assetStatusFilter) return false;
+    if (assetStatusFilter === 'Archived') { if (!a.archived) return false; }
+    else { if (a.archived) return false; if (assetStatusFilter !== 'all' && a.status !== assetStatusFilter) return false; }
     if (!assetSearchTab) return true;
     const s = assetSearchTab.toLowerCase();
     return (a.name || '').toLowerCase().includes(s) || (a.registration_or_serial || '').toLowerCase().includes(s) || (a.asset_number || '').toLowerCase().includes(s);
@@ -2334,7 +2419,7 @@ function renderAssetsList(c) {
       <div class="toolbar">
         <h2 style="border:none;">Assets <span class="note">(${assets.length} total)</span></h2>
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-          ${['all', 'In Use', 'Under Repair', 'Disposed'].map(s => `<span class="chip ${assetStatusFilter === s ? 'active' : ''}" data-status="${esc(s)}">${esc(s === 'all' ? 'All' : s)}</span>`).join('')}
+          ${['all', 'In Use', 'Under Repair', 'Disposed', 'Archived'].map(s => `<span class="chip ${assetStatusFilter === s ? 'active' : ''}" data-status="${esc(s)}">${esc(s === 'all' ? 'All' : s)}</span>`).join('')}
           <input type="text" placeholder="Search…" id="assetSearch" value="${esc(assetSearchTab)}" style="max-width:200px;">
         </div>
       </div>
@@ -2359,7 +2444,7 @@ function renderAssetsList(c) {
               <td style="white-space:nowrap;">
                 <button class="btn ghost small" data-act="edit" data-id="${a.id}">Edit</button>
                 ${a.status !== 'Disposed' ? `<button class="btn small" data-act="dispose" data-id="${a.id}">Dispose</button>` : `<button class="btn small" data-act="reinstate" data-id="${a.id}">Reinstate</button>`}
-                <button class="btn danger small" data-act="delete" data-id="${a.id}">Delete</button>
+                ${a.status === 'Disposed' && !a.archived ? `<button class="btn ghost small" data-act="archive" data-id="${a.id}">Archive</button>` : ''}
               </td>
             </tr>`;
           }).join('') || `<tr><td colspan="8" style="text-align:center;color:var(--steel);padding:24px;">No assets recorded yet.</td></tr>`}
@@ -2380,9 +2465,20 @@ function renderAssetsList(c) {
       if (btn.dataset.act === 'edit') renderAssetForm(c, asset);
       if (btn.dataset.act === 'dispose') openDisposeModal(asset, c);
       if (btn.dataset.act === 'reinstate') await reinstateAsset(asset, c);
-      if (btn.dataset.act === 'delete') await deleteAsset(asset, c);
+      if (btn.dataset.act === 'archive') await archiveAsset(asset, c);
     };
   });
+}
+
+// Assets are never deleted. A disposed (sold/scrapped) asset can be archived:
+// it leaves the everyday list but stays in the register and the export.
+async function archiveAsset(asset, c) {
+  if (asset.status !== 'Disposed') { alert('Only a disposed (sold or scrapped) asset can be archived.'); return; }
+  if (!confirm(`Archive "${asset.name}"? It will leave the main list but stays in the register (see the Archived filter).`)) return;
+  const { error } = await supabaseClient.from('assets').update({ archived: true }).eq('id', asset.id);
+  if (error) { alert('Could not archive — ' + error.message); return; }
+  asset.archived = true;
+  renderAssetsList(c);
 }
 
 function renderAssetForm(c, existing) {
@@ -2492,7 +2588,7 @@ function openDisposeModal(asset, c) {
 
 async function reinstateAsset(asset, c) {
   if (!confirm(`Reinstate "${asset.name}" back to "In Use"? This clears its disposal date/notes — use this if it was disposed by mistake or has come back into service.`)) return;
-  const { error } = await supabaseClient.from('assets').update({ status: 'In Use', disposal_date: null, disposal_notes: null }).eq('id', asset.id);
+  const { error } = await supabaseClient.from('assets').update({ status: 'In Use', disposal_date: null, disposal_notes: null, archived: false }).eq('id', asset.id);
   if (error) { alert('Could not reinstate — ' + error.message); return; }
   asset.status = 'In Use'; asset.disposal_date = null; asset.disposal_notes = null;
   renderAssetsList(c);
@@ -2616,6 +2712,11 @@ function renderExport(c) {
       <h2>Invoices</h2>
       <p>${unexportedInvoices.length} invoice${unexportedInvoices.length===1?'':'s'} not yet exported. ${exportedInvoices.length} already exported.</p>
       <button class="btn accent" id="exportInvBtn" ${unexportedInvoices.length ? '' : 'disabled'}>Export Unexported Invoices (CSV)</button>
+      <div style="margin-top:16px;">
+        <b>Credit notes:</b> ${STATE.documents.filter(d => d.type === 'credit' && !d.exportedToQBO).length} not yet exported.
+        <button class="btn small" id="exportCnBtn" ${STATE.documents.some(d => d.type === 'credit' && !d.exportedToQBO) ? '' : 'disabled'}>Export Credit Notes (CSV)</button>
+        <p class="note">A list of credit notes (number, date, customer, invoice, reason, lines and VAT) to capture as credit notes in QuickBooks.</p>
+      </div>
       <p class="note">Matches QuickBooks Online's "Invoices" CSV import template exactly (column headers, invoice-header-once-per-invoice grouping, DD/MM/YYYY dates, 15%/Exempt tax codes) — test with one invoice first before relying on it.</p>
     </div>
   `;
@@ -2627,6 +2728,21 @@ function renderExport(c) {
     const { error } = await supabaseClient.from('customers').update({ exported_to_qbo: true }).in('num', nums);
     if (error) { alert('CSV downloaded, but could not mark customers as exported — ' + error.message); return; }
     newCustomers.forEach(x => x.exportedToQBO = true);
+    renderExport(c);
+  };
+  document.getElementById('exportCnBtn').onclick = async () => {
+    const list = STATE.documents.filter(d => d.type === 'credit' && !d.exportedToQBO);
+    const rows = [['Credit Note No','Date','Customer','Invoice No','Reason','Item','Description','Quantity','Rate','Amount (excl VAT)','Tax Code','VAT','Credit Note Total']];
+    list.forEach(cn => (cn.items || []).forEach((it, i) => {
+      const amt = (Number(it.qty) || 0) * (Number(it.rate) || 0);
+      rows.push([i === 0 ? cn.number : '', i === 0 ? fmtDate(cn.issueDate) : '', i === 0 ? cn.customer.name : '', i === 0 ? cn.creditFor : '',
+        i === 0 ? cn.creditReason : '', it.code, it.desc, it.qty, it.rate, amt.toFixed(2), it.vat === 'Standard' ? '15%' : 'Exempt',
+        (it.vat === 'Standard' ? amt * 0.15 : 0).toFixed(2), i === 0 ? Number(cn.total).toFixed(2) : '']);
+    }));
+    downloadCSV(`hakuna_credit_notes_${todayISO()}.csv`, rows);
+    const { error } = await supabaseClient.from('documents').update({ exported_to_qbo: true }).in('id', list.map(d => d.id));
+    if (error) { alert('CSV downloaded, but could not mark credit notes as exported — ' + error.message); return; }
+    list.forEach(d => { d.exportedToQBO = true; });
     renderExport(c);
   };
   document.getElementById('exportInvBtn').onclick = async () => {
@@ -2692,7 +2808,7 @@ function showConfigMissingScreen() {
 let LIVE_CHANNEL = null;
 let LIVE_TIMER = null;
 function anyModalOpen() {
-  return !!document.querySelector('#previewModal, #declineModal, #itemEditModal, #stockModal, #disposeModal');
+  return !!document.querySelector('#previewModal, #declineModal, #itemEditModal, #stockModal, #disposeModal, #creditModal');
 }
 function scheduleLiveRefresh() {
   clearTimeout(LIVE_TIMER);
@@ -2782,8 +2898,15 @@ function showIdleWarning(secondsLeft) {
   }
   w.querySelector('.idle-secs').textContent = Math.max(0, secondsLeft);
 }
+const SESSION_DAY_KEY = 'hakuna_session_day';
+function saToday() { return new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Johannesburg' }); }
+function sessionDay() { try { return localStorage.getItem(SESSION_DAY_KEY) || ''; } catch (e) { return ''; } }
+function markSessionDay() { try { localStorage.setItem(SESSION_DAY_KEY, saToday()); } catch (e) {} }
 function idleCheck() {
   if (!CURRENT_USER) return;
+  // Everyone is signed out at midnight and signs in fresh each day.
+  const day = sessionDay();
+  if (day && day !== saToday()) { idleSignOut(false, 'midnight'); return; }
   const idle = Date.now() - idleLast();
   if (idle >= IDLE_LIMIT_MS) { idleSignOut(); return; }
   if (idle >= IDLE_LIMIT_MS - IDLE_WARN_MS) showIdleWarning(Math.ceil((IDLE_LIMIT_MS - idle) / 1000));
@@ -2793,6 +2916,9 @@ function startIdleWatch() {
   // Reopening the app after more than 15 minutes away needs a fresh sign-in.
   const prev = idleStoredLast();
   if (prev && Date.now() - prev >= IDLE_LIMIT_MS) { idleSignOut(); return false; }
+  const day = sessionDay();
+  if (day && day !== saToday()) { idleSignOut(false, 'midnight'); return false; }
+  if (!day) markSessionDay();
   idleMarkActive();
   if (IDLE_INTERVAL) return true;
   ['mousemove', 'mousedown', 'keydown', 'scroll', 'touchstart', 'wheel'].forEach(ev =>
@@ -2805,12 +2931,14 @@ function startIdleWatch() {
   IDLE_INTERVAL = setInterval(idleCheck, 1000);
   return true;
 }
-async function idleSignOut(fromOtherTab) {
+async function idleSignOut(fromOtherTab, reason) {
   if (!CURRENT_USER) return;
   if (!fromOtherTab) { try { localStorage.setItem('hakuna_signed_out', String(Date.now())); } catch (e) {} }
   // 'local' signs out this browser only, not the same person's other computers.
   await handleLogout('local');
-  showLoginScreen('You were signed out after 15 minutes without activity. Please sign in again.');
+  showLoginScreen(reason === 'midnight'
+    ? 'Everyone is signed out at midnight. Please sign in again to start the day.'
+    : 'You were signed out after 15 minutes without activity. Please sign in again.');
 }
 
 function showLoginScreen(errorMsg) {
@@ -2844,13 +2972,14 @@ async function handleLogin() {
   CURRENT_USER = { id: data.user.id, email: data.user.email };
   idleMarkActive();
   try { localStorage.setItem(IDLE_KEY, String(Date.now())); } catch (e) {}
+  markSessionDay();
   await showApp();
 }
 
 async function handleLogout(scope) {
   stopLiveUpdates();
   CURRENT_USER = null;
-  document.querySelectorAll('#previewModal, #declineModal, #disposeModal, #itemEditModal, #stockModal, #idleWarning').forEach(el => el.remove());
+  document.querySelectorAll('#previewModal, #declineModal, #disposeModal, #itemEditModal, #stockModal, #creditModal, #idleWarning').forEach(el => el.remove());
   try { await supabaseClient.auth.signOut(scope === 'local' ? { scope: 'local' } : undefined); } catch (e) { console.error(e); }
   STATE.loaded = false;
   showLoginScreen();
