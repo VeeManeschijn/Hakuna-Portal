@@ -46,6 +46,11 @@
   table.data th{background:var(--ink);color:#fff;text-align:left;padding:8px 10px;font-size:12px;text-transform:uppercase;letter-spacing:.3px;}
   table.data td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top;}
   table.data tr:hover td{background:#fafafa;}
+  table.data td.nowrap{white-space:nowrap;}
+  table.data td.cust-cell{min-width:170px;}
+  table.data td.actions-cell{width:1%;}
+  .row-actions{display:flex;flex-wrap:wrap;gap:4px;justify-content:flex-start;width:270px;}
+  .row-actions .btn{white-space:nowrap;}
   .pill{display:inline-block;padding:3px 9px;border-radius:20px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.3px;}
   .pill.draft{background:#e8e8e8;color:#555;}
   .pill.sent{background:#dbeafe;color:#1d4ed8;}
@@ -169,6 +174,8 @@
     table.data td{display:block;border:none;padding:5px 0;}
     table.data td[data-label]::before{content:attr(data-label);display:block;font-size:10px;font-weight:700;color:var(--steel);text-transform:uppercase;letter-spacing:.3px;margin-bottom:2px;}
     table.data td:empty{display:none;}
+    .row-actions{width:auto;justify-content:flex-start;}
+    table.data td.actions-cell{width:auto;}
 
     /* Line items entry table -> one card per line item, inputs
        stacked full-width with labels above them. */
@@ -835,15 +842,13 @@ function dashboardRowsHtml(filtered) {
     <tr>
       <td data-label="Number"><b>${esc(d.number)}</b></td>
       <td data-label="Type">${docTypeLabel(d)}</td>
-      <td data-label="Customer"><a href="#" data-cust="${esc(d.customer.num)}" class="cust-link">${esc(d.customer.name)}</a></td>
+      <td data-label="Customer" class="cust-cell"><a href="#" data-cust="${esc(d.customer.num)}" class="cust-link">${esc(d.customer.name)}</a></td>
       <td data-label="Truck Reg">${esc(d.truckReg)}</td>
-      <td data-label="Total">R ${fmtMoney(d.total)}</td>
+      <td data-label="Total" class="nowrap">R ${fmtMoney(d.total)}</td>
       <td data-label="Status">${docStatusHtml(d)}</td>
-      <td data-label="Date">${fmtDate(d.issueDate)}</td>
+      <td data-label="Date" class="nowrap">${fmtDate(d.issueDate)}</td>
       ${canViewAudit() ? `<td data-label="By" class="by-cell" title="Created by ${esc(d.createdByEmail || 'unknown')}">${esc(personName(d.createdByEmail))}</td>` : ''}
-      <td style="white-space:nowrap;">
-        ${docActionsHtml(d)}
-      </td>
+      <td class="actions-cell"><div class="row-actions">${docActionsHtml(d)}</div></td>
     </tr>`).join('') || `<tr><td colspan="8" style="text-align:center;color:var(--steel);padding:24px;">No documents yet. Create your first quote above.</td></tr>`.replace('colspan="8"', `colspan="${canViewAudit() ? 9 : 8}"`);
 }
 
@@ -1066,12 +1071,10 @@ function renderCustomerSummary(c, customerNum) {
               <td data-label="Number"><b>${esc(d.number)}</b></td>
               <td data-label="Type">${docTypeLabel(d)}</td>
               <td data-label="Truck Reg">${esc(d.truckReg)}</td>
-              <td data-label="Total">R ${fmtMoney(d.total)}</td>
+              <td data-label="Total" class="nowrap">R ${fmtMoney(d.total)}</td>
               <td data-label="Status">${docStatusHtml(d)}</td>
-              <td data-label="Date">${fmtDate(d.issueDate)}</td>
-              <td style="white-space:nowrap;">
-                ${docActionsHtml(d)}
-              </td>
+              <td data-label="Date" class="nowrap">${fmtDate(d.issueDate)}</td>
+              <td class="actions-cell"><div class="row-actions">${docActionsHtml(d)}</div></td>
             </tr>`).join('') || `<tr><td colspan="7" style="text-align:center;color:var(--steel);padding:24px;">No quotes or invoices for this customer yet.</td></tr>`}
         </tbody>
       </table>
