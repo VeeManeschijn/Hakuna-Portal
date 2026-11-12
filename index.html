@@ -99,6 +99,13 @@
   table.statement-items th:nth-child(5),table.statement-items td:nth-child(5){text-align:left;}
   table.statement-items th:nth-child(6),table.statement-items td:nth-child(6),table.statement-items th:nth-child(7),table.statement-items td:nth-child(7){text-align:right;}
   table.statement-ageing th{text-align:right!important;}
+  .audit-bar{padding:8px 20px;background:#eef2f6;color:var(--ink);font-size:13px;border-bottom:1px solid var(--line);}
+  .audit-bar .btn{margin-left:8px;}
+  .audit-bar #docAuditList{margin-top:8px;max-height:260px;overflow:auto;background:#fff;}
+  .audit-changes{margin:4px 0 0 0;padding-left:18px;font-size:12px;color:var(--steel);}
+  table.audit-table td{vertical-align:top;}
+  td.by-cell{color:var(--steel);font-size:12px;white-space:nowrap;}
+  @media print{ .audit-bar{display:none!important;} }
   button.is-busy{opacity:.55;cursor:progress;}
   body.app-busy{cursor:progress;}
   .pill.credited{background:#ede9fe;color:#5b21b6;}
@@ -285,6 +292,7 @@ function tabAllowed(id) {
   if (ROLE_TABS[CURRENT_ROLE]) return ROLE_TABS[CURRENT_ROLE].includes(id);
   if (id === 'receipts') return canManageStock();
   if (id === 'settings') return canEditSettings();
+  if (id === 'activity') return canViewAudit();
   if (id === 'assets') return CURRENT_ROLE !== 'no_stock';
   if (id === 'export') return canExportQBO();
   return true;
@@ -754,6 +762,7 @@ const TABS = [
   { id: 'receipts', label: 'Stock Receipts' },
   { id: 'assets', label: 'Assets' },
   { id: 'settings', label: 'Settings' },
+  { id: 'activity', label: 'Activity' },
   { id: 'export', label: 'Export to QuickBooks' },
 ];
 let CURRENT_TAB = 'dashboard';
@@ -794,6 +803,7 @@ function renderContent() {
     case 'receipts': return canManageStock() ? renderStockReceipts(c) : renderDashboard(c);
     case 'assets': return renderAssets(c);
     case 'settings': return renderSettings(c);
+    case 'activity': return canViewAudit() ? renderActivity(c) : renderDashboard(c);
     case 'export': return canExportQBO() ? renderExport(c) : renderDashboard(c);
     case 'customerSummary': return renderCustomerSummary(c, VIEW_CUSTOMER_NUM);
   }
@@ -830,10 +840,11 @@ function dashboardRowsHtml(filtered) {
       <td data-label="Total">R ${fmtMoney(d.total)}</td>
       <td data-label="Status">${docStatusHtml(d)}</td>
       <td data-label="Date">${fmtDate(d.issueDate)}</td>
+      ${canViewAudit() ? `<td data-label="By" class="by-cell" title="Created by ${esc(d.createdByEmail || 'unknown')}">${esc(personName(d.createdByEmail))}</td>` : ''}
       <td style="white-space:nowrap;">
         ${docActionsHtml(d)}
       </td>
-    </tr>`).join('') || `<tr><td colspan="8" style="text-align:center;color:var(--steel);padding:24px;">No documents yet. Create your first quote above.</td></tr>`;
+    </tr>`).join('') || `<tr><td colspan="8" style="text-align:center;color:var(--steel);padding:24px;">No documents yet. Create your first quote above.</td></tr>`.replace('colspan="8"', `colspan="${canViewAudit() ? 9 : 8}"`);
 }
 
 // Jacobus, Lizette and the administrator issue credit notes and edit settings.
@@ -964,7 +975,7 @@ function renderDashboard(c) {
         <input type="text" placeholder="Search customer, number, truck reg…" style="max-width:260px;" id="dashSearchInput" value="${esc(dashSearch)}">
       </div>
       <table class="data">
-        <thead><tr><th>Number</th><th>Type</th><th>Customer</th><th>Truck Reg</th><th>Total</th><th>Status</th><th>Date</th><th>Actions</th></tr></thead>
+        <thead><tr><th>Number</th><th>Type</th><th>Customer</th><th>Truck Reg</th><th>Total</th><th>Status</th><th>Date</th>${canViewAudit() ? '<th>By</th>' : ''}<th>Actions</th></tr></thead>
         <tbody id="dashTbody"></tbody>
       </table>
     </div>
@@ -1629,6 +1640,7 @@ function openPrintPreview(doc) {
           </div>
         </div>
         ${approvalBar}
+        ${canViewAudit() ? `<div id="docAuditBar" class="audit-bar"><span id="docAuditSummary">Created by ${esc(personName(doc.createdByEmail))}${doc.createdAt ? ' on ' + fmtDateTime(doc.createdAt) : ''}</span> <button class="btn ghost small" id="docAuditToggle">Show history</button><div id="docAuditList" style="display:none;"></div></div>` : ''}
         <div style="max-height:80vh;overflow:auto;">${html}</div>
       </div>
     </div>
@@ -1637,6 +1649,7 @@ function openPrintPreview(doc) {
   wrapper.innerHTML = modalHtml;
   document.body.appendChild(wrapper.firstElementChild);
   document.getElementById('closePreviewBtn').onclick = () => document.getElementById('previewModal').remove();
+  if (canViewAudit()) wireDocAudit(doc);
   document.getElementById('doPrintBtn').onclick = () => { if (!quoteBlockedForMe(doc)) window.print(); };
   document.getElementById('doEmailBtn').onclick = () => { if (!quoteBlockedForMe(doc)) emailDocument(doc); };
   const approveBtn = document.getElementById('doApproveBtn');
@@ -2621,6 +2634,210 @@ function exportAssetRegister() {
 }
 
 /* ===================== Settings tab ===================== */
+/* ===================== Activity (audit trail) ===================== */
+// Who did what. Written by the database itself on every change; only Jacobus,
+// Lizette and the administrator can read it, and nobody can change or delete it.
+// Shown on screen only - never on printed or emailed documents.
+function canViewAudit() { return !['no_stock', 'stock_controller'].includes(CURRENT_ROLE); }
+const PEOPLE = {
+  'jacobusbotha40@gmail.com': 'Jacobus', 'lizettebotha66@gmail.com': 'Lizette',
+  'admin1@hakunatrailers.co.za': 'Paula', 'admin2@hakunatrailers.co.za': 'Adele',
+  'hakunaadmin@gmail.com': 'Bianca', 'veridiumacc@gmail.com': 'Verouska',
+};
+function personName(email) {
+  if (!email) return 'Unknown';
+  const e = String(email).toLowerCase();
+  return PEOPLE[e] || e.split('@')[0];
+}
+function fmtDateTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  const t = d.toLocaleTimeString('en-ZA', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Africa/Johannesburg' });
+  const day = d.toLocaleDateString('en-CA', { timeZone: 'Africa/Johannesburg' });
+  return `${fmtDate(day)} ${t}`;
+}
+const AUDIT_ENTITIES = [
+  ['', 'Everything'], ['quote', 'Quotes'], ['invoice', 'Invoices'], ['credit', 'Credit notes'],
+  ['customer', 'Customers'], ['item', 'Items & stock'], ['stock receipt', 'Stock receipts'],
+  ['asset', 'Assets'], ['settings', 'Settings'], ['numbering', 'Numbering'],
+];
+const AUDIT_FIELD_LABELS = {
+  status: 'Status', number: 'Number', customer: 'Customer', customer_num: 'Customer no.', truck_reg: 'Truck reg',
+  reg_6m: 'Reg. 6m', reg_12m: 'Reg. 12m', customer_depo: 'Customer depo', po_number: 'PO number', jobcard: 'Jobcard',
+  tec: 'Tec', hkm: 'HKM', quote_ref: 'Quote no.', issue_date: 'Date', due_date: 'Due date', items: 'Lines', total: 'Total',
+  special_notes: 'Special notes', approved_at: 'Approval', exported_to_qbo: 'Exported to QuickBooks',
+  credit_for: 'Invoice no.', credit_reason: 'Reason', stock_returned: 'Parts returned',
+  name: 'Name', contact: 'Contact', email: 'Email', phone: 'Phone', address: 'Address', city: 'City', post_code: 'Post code',
+  vat: 'VAT', reg: 'Reg no.', charge_vat: 'Charge VAT', terms: 'Terms', disabled: 'Disabled',
+  code: 'Code', description: 'Description', price: 'Price', stock_code: 'Stock code', archived: 'Archived',
+  asset_number: 'Asset no.', category: 'Category', registration_or_serial: 'Reg/serial', location: 'Location',
+  purchase_date: 'Purchase date', purchase_cost: 'Cost', useful_life_years: 'Useful life (years)', salvage_value: 'Salvage value',
+  disposal_date: 'Disposal date', disposal_notes: 'Disposal notes', notes: 'Notes',
+  merchant_no: 'Merchant no.', absa_acc: 'ABSA account', absa_branch: 'ABSA branch', fnb_acc: 'FNB account', fnb_branch: 'FNB branch',
+  reorder_threshold: 'Reorder level', quote_num: 'Next quote no.', invoice_num: 'Next invoice no.', customer_num_counter: 'Next customer no.',
+  item_code: 'Next item code', asset_num: 'Next asset no.', credit_num: 'Next credit note no.',
+  supplier: 'Supplier', reference: 'Reference', receipt_date: 'Receipt date',
+};
+function auditFieldLabel(entity, k) {
+  if (entity === 'numbering' && k === 'customer_num') return 'Next customer no.';
+  return AUDIT_FIELD_LABELS[k] || k.replace(/_/g, ' ');
+}
+function auditValue(k, v) {
+  if (v === null || v === undefined || v === '') return '—';
+  if (typeof v === 'boolean') return v ? 'Yes' : 'No';
+  if (k === 'approved_at') return 'approved';
+  if (['total', 'price', 'purchase_cost', 'salvage_value'].includes(k)) return 'R ' + fmtMoney(v);
+  if (/_date$/.test(k) && /^\d{4}-\d{2}-\d{2}/.test(String(v))) return fmtDate(String(v).slice(0, 10));
+  return String(v);
+}
+// Line changes: added / removed / changed lines, matched by item code.
+function auditLinesDiff(before, after) {
+  const key = (l, i) => (l && l.code) ? String(l.code) : '#' + i;
+  const label = l => [l.code, l.desc].filter(Boolean).join(' ') || 'line';
+  const a = new Map((before || []).map((l, i) => [key(l, i), l]));
+  const b = new Map((after || []).map((l, i) => [key(l, i), l]));
+  const out = [];
+  for (const [k, l] of b) {
+    const o = a.get(k);
+    if (!o) { out.push(`added ${label(l)} × ${l.qty} @ R ${fmtMoney(l.rate)}`); continue; }
+    const bits = [];
+    if (Number(o.qty) !== Number(l.qty)) bits.push(`qty ${o.qty} → ${l.qty}`);
+    if (Number(o.rate) !== Number(l.rate)) bits.push(`price R ${fmtMoney(o.rate)} → R ${fmtMoney(l.rate)}`);
+    if ((o.desc || '') !== (l.desc || '')) bits.push(`description "${o.desc || ''}" → "${l.desc || ''}"`);
+    if ((o.notes || '') !== (l.notes || '')) bits.push(`line note "${o.notes || ''}" → "${l.notes || ''}"`);
+    if ((o.vat || '') !== (l.vat || '')) bits.push(`tax ${o.vat || '—'} → ${l.vat || '—'}`);
+    if (bits.length) out.push(`${label(l)}: ${bits.join(', ')}`);
+  }
+  for (const [k, o] of a) if (!b.has(k)) out.push(`removed ${label(o)} × ${o.qty}`);
+  return out.length ? out : ['lines re-ordered'];
+}
+function auditChangesHtml(r) {
+  const ch = r.changes || {};
+  const keys = Object.keys(ch);
+  if (!keys.length) return '';
+  const rows = [];
+  for (const k of keys) {
+    const [from, to] = ch[k] || [];
+    if (k === 'items') { auditLinesDiff(from, to).forEach(t => rows.push(`<li>Lines: ${esc(t)}</li>`)); continue; }
+    if (k === 'approved_at') { rows.push(`<li>${to ? 'Approved' : 'Approval removed (needs re-approval)'}</li>`); continue; }
+    rows.push(`<li>${esc(auditFieldLabel(r.entity, k))}: ${esc(auditValue(k, from))} → ${esc(auditValue(k, to))}</li>`);
+  }
+  return `<ul class="audit-changes">${rows.join('')}</ul>`;
+}
+const AUDIT_ENTITY_LABEL = { quote: 'Quote', invoice: 'Invoice', credit: 'Credit note', customer: 'Customer', item: 'Item',
+  asset: 'Asset', settings: 'Settings', numbering: 'Numbering', 'stock receipt': 'Stock receipt' };
+function auditRowHtml(r, withWhat) {
+  const doc = ['quote', 'invoice', 'credit'].includes(r.entity) ? STATE.documents.find(d => d.id === r.entity_id) : null;
+  const what = `${esc(AUDIT_ENTITY_LABEL[r.entity] || r.entity)} ${doc ? `<a href="#" class="audit-doc" data-id="${esc(r.entity_id)}">${esc(r.entity_ref || '')}</a>` : esc(r.entity_ref || '')}`;
+  return `<tr>
+    <td data-label="When" style="white-space:nowrap;">${fmtDateTime(r.at)}</td>
+    <td data-label="Who"><b>${esc(personName(r.user_email))}</b></td>
+    ${withWhat ? `<td data-label="What">${what}</td>` : ''}
+    <td data-label="Action">${esc(r.action)}</td>
+    <td data-label="Details">${esc(r.detail || '')}${auditChangesHtml(r)}</td>
+  </tr>`;
+}
+
+let auditFilter = { who: '', entity: '', from: '', to: '', q: '' };
+let auditRows = [];
+const AUDIT_PAGE = 200;
+async function fetchAudit(offset) {
+  let q = supabaseClient.from('audit_log').select('*').order('at', { ascending: false }).order('id', { ascending: false })
+    .range(offset, offset + AUDIT_PAGE - 1);
+  if (auditFilter.who) q = q.eq('user_email', auditFilter.who);
+  if (auditFilter.entity) q = q.eq('entity', auditFilter.entity);
+  if (auditFilter.from) q = q.gte('at', auditFilter.from + 'T00:00:00+02:00');
+  if (auditFilter.to) q = q.lte('at', auditFilter.to + 'T23:59:59+02:00');
+  if (auditFilter.q) {
+    const term = auditFilter.q.replace(/[%,()*]/g, ' ').trim();
+    if (term) q = q.or(`entity_ref.ilike.%${term}%,detail.ilike.%${term}%`);
+  }
+  const { data, error } = await q;
+  if (error) throw error;
+  return data || [];
+}
+function renderActivity(c) {
+  const people = Object.entries(PEOPLE);
+  c.innerHTML = `
+    <div class="card">
+      <h2>Activity</h2>
+      <p class="note">Who created, changed, approved, credited or deleted what. Recorded automatically by the system and visible only to Jacobus, Lizette and Verouska. It never appears on documents sent to clients. History before 12 Nov 2026 shows only who created and approved each document.</p>
+      <div class="toolbar" style="flex-wrap:wrap;gap:8px;">
+        <select id="auWho" style="max-width:180px;"><option value="">Everyone</option>${people.map(([e, n]) => `<option value="${e}" ${auditFilter.who === e ? 'selected' : ''}>${n}</option>`).join('')}</select>
+        <select id="auEntity" style="max-width:180px;">${AUDIT_ENTITIES.map(([v, l]) => `<option value="${v}" ${auditFilter.entity === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+        <label class="note">From <input type="date" id="auFrom" style="width:auto;" value="${esc(auditFilter.from)}"></label>
+        <label class="note">To <input type="date" id="auTo" style="width:auto;" value="${esc(auditFilter.to)}"></label>
+        <input type="text" id="auQ" placeholder="Search number, customer, item…" value="${esc(auditFilter.q)}" style="max-width:240px;">
+      </div>
+      <table class="data audit-table">
+        <thead><tr><th>When</th><th>Who</th><th>What</th><th>Action</th><th>Details</th></tr></thead>
+        <tbody id="auBody"><tr><td colspan="5" class="note" style="text-align:center;padding:20px;">Loading…</td></tr></tbody>
+      </table>
+      <div style="text-align:center;margin-top:10px;"><button class="btn ghost small" id="auMore" style="display:none;">Load more</button></div>
+    </div>`;
+  const body = document.getElementById('auBody');
+  const more = document.getElementById('auMore');
+  const draw = () => {
+    body.innerHTML = auditRows.map(r => auditRowHtml(r, true)).join('') ||
+      `<tr><td colspan="5" class="note" style="text-align:center;padding:20px;">Nothing found for these filters.</td></tr>`;
+    body.querySelectorAll('a.audit-doc').forEach(a => a.onclick = e => {
+      e.preventDefault();
+      const d = STATE.documents.find(x => x.id === a.dataset.id);
+      if (d) openPrintPreview(d);
+    });
+  };
+  const load = async (append) => {
+    more.disabled = true;
+    try {
+      const rows = await fetchAudit(append ? auditRows.length : 0);
+      auditRows = append ? auditRows.concat(rows) : rows;
+      draw();
+      more.style.display = rows.length === AUDIT_PAGE ? '' : 'none';
+    } catch (err) {
+      body.innerHTML = `<tr><td colspan="5" style="color:var(--danger);padding:16px;">Could not load the activity log — ${esc(err.message || err)}</td></tr>`;
+    }
+    more.disabled = false;
+  };
+  const onFilter = () => {
+    auditFilter = { who: auWho.value, entity: auEntity.value, from: auFrom.value, to: auTo.value, q: auQ.value.trim() };
+    load(false);
+  };
+  const auWho = document.getElementById('auWho'), auEntity = document.getElementById('auEntity'),
+        auFrom = document.getElementById('auFrom'), auTo = document.getElementById('auTo'), auQ = document.getElementById('auQ');
+  [auWho, auEntity, auFrom, auTo].forEach(el => el.onchange = onFilter);
+  let t = null;
+  auQ.oninput = () => { clearTimeout(t); t = setTimeout(onFilter, 400); };
+  more.onclick = () => load(true);
+  load(false);
+}
+// The history strip in a document's preview window.
+async function wireDocAudit(doc) {
+  const toggle = document.getElementById('docAuditToggle');
+  const list = document.getElementById('docAuditList');
+  const summary = document.getElementById('docAuditSummary');
+  if (!toggle || !doc.id) return;
+  let rows = null;
+  try {
+    const { data, error } = await supabaseClient.from('audit_log').select('*').eq('entity_id', doc.id)
+      .order('at', { ascending: false }).order('id', { ascending: false });
+    if (error) throw error;
+    rows = data || [];
+  } catch (err) { summary.textContent = 'History could not be loaded.'; toggle.style.display = 'none'; return; }
+  const created = rows.slice().reverse().find(r => r.action === 'created' || r.action === 'issued');
+  const lastEdit = rows.find(r => r.action !== 'created' && r.action !== 'issued');
+  summary.innerHTML = `${created ? `Created by <b>${esc(personName(created.user_email))}</b> on ${fmtDateTime(created.at)}` : `Created by <b>${esc(personName(doc.createdByEmail))}</b>`}` +
+    (lastEdit ? ` · Last change: <b>${esc(personName(lastEdit.user_email))}</b> ${esc(lastEdit.action)} on ${fmtDateTime(lastEdit.at)}` : '');
+  if (!rows.length) { toggle.style.display = 'none'; return; }
+  toggle.textContent = `Show history (${rows.length})`;
+  list.innerHTML = `<table class="data audit-table"><thead><tr><th>When</th><th>Who</th><th>Action</th><th>Details</th></tr></thead><tbody>${rows.map(r => auditRowHtml(r, false)).join('')}</tbody></table>`;
+  toggle.onclick = () => {
+    const open = list.style.display === 'none';
+    list.style.display = open ? '' : 'none';
+    toggle.textContent = open ? 'Hide history' : `Show history (${rows.length})`;
+  };
+}
+
 function renderSettings(c) {
   const co = STATE.company;
   c.innerHTML = `
