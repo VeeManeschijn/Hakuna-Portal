@@ -47,9 +47,11 @@
   table.data td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top;}
   table.data tr:hover td{background:#fafafa;}
   table.data td.nowrap{white-space:nowrap;}
-  table.data td.cust-cell{min-width:170px;}
-  table.data td.actions-cell{width:1%;}
-  .row-actions{display:flex;flex-wrap:wrap;gap:4px;justify-content:flex-start;width:270px;}
+  table.data td.cust-cell{min-width:150px;}
+  table.data td.reg-cell{min-width:90px;max-width:160px;overflow-wrap:anywhere;}
+  .row-actions{display:flex;flex-wrap:wrap;gap:4px;justify-content:flex-start;min-width:258px;max-width:280px;}
+  .table-scroll{overflow-x:auto;}
+  @media (max-width: 1150px){ .row-actions{min-width:200px;} }
   .row-actions .btn{white-space:nowrap;}
   .pill{display:inline-block;padding:3px 9px;border-radius:20px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.3px;}
   .pill.draft{background:#e8e8e8;color:#555;}
@@ -175,7 +177,6 @@
     table.data td[data-label]::before{content:attr(data-label);display:block;font-size:10px;font-weight:700;color:var(--steel);text-transform:uppercase;letter-spacing:.3px;margin-bottom:2px;}
     table.data td:empty{display:none;}
     .row-actions{width:auto;justify-content:flex-start;}
-    table.data td.actions-cell{width:auto;}
 
     /* Line items entry table -> one card per line item, inputs
        stacked full-width with labels above them. */
@@ -843,7 +844,7 @@ function dashboardRowsHtml(filtered) {
       <td data-label="Number"><b>${esc(d.number)}</b></td>
       <td data-label="Type">${docTypeLabel(d)}</td>
       <td data-label="Customer" class="cust-cell"><a href="#" data-cust="${esc(d.customer.num)}" class="cust-link">${esc(d.customer.name)}</a></td>
-      <td data-label="Truck Reg">${esc(d.truckReg)}</td>
+      <td data-label="Truck Reg" class="reg-cell">${esc(d.truckReg)}</td>
       <td data-label="Total" class="nowrap">R ${fmtMoney(d.total)}</td>
       <td data-label="Status">${docStatusHtml(d)}</td>
       <td data-label="Date" class="nowrap">${fmtDate(d.issueDate)}</td>
@@ -979,10 +980,10 @@ function renderDashboard(c) {
         </div>
         <input type="text" placeholder="Search customer, number, truck reg…" style="max-width:260px;" id="dashSearchInput" value="${esc(dashSearch)}">
       </div>
-      <table class="data">
+      <div class="table-scroll"><table class="data">
         <thead><tr><th>Number</th><th>Type</th><th>Customer</th><th>Truck Reg</th><th>Total</th><th>Status</th><th>Date</th>${canViewAudit() ? '<th>By</th>' : ''}<th>Actions</th></tr></thead>
         <tbody id="dashTbody"></tbody>
-      </table>
+      </table></div>
     </div>
   `;
   if (document.getElementById('goToItemsBtn')) {
@@ -1063,21 +1064,21 @@ function renderCustomerSummary(c, customerNum) {
     </div>
     <div class="card">
       <h2>Transaction history</h2>
-      <table class="data">
+      <div class="table-scroll"><table class="data">
         <thead><tr><th>Number</th><th>Type</th><th>Truck Reg</th><th>Total</th><th>Status</th><th>Date</th><th>Actions</th></tr></thead>
         <tbody id="custSummaryTbody">
           ${docs.map(d => `
             <tr>
               <td data-label="Number"><b>${esc(d.number)}</b></td>
               <td data-label="Type">${docTypeLabel(d)}</td>
-              <td data-label="Truck Reg">${esc(d.truckReg)}</td>
+              <td data-label="Truck Reg" class="reg-cell">${esc(d.truckReg)}</td>
               <td data-label="Total" class="nowrap">R ${fmtMoney(d.total)}</td>
               <td data-label="Status">${docStatusHtml(d)}</td>
               <td data-label="Date" class="nowrap">${fmtDate(d.issueDate)}</td>
               <td class="actions-cell"><div class="row-actions">${docActionsHtml(d)}</div></td>
             </tr>`).join('') || `<tr><td colspan="7" style="text-align:center;color:var(--steel);padding:24px;">No quotes or invoices for this customer yet.</td></tr>`}
         </tbody>
-      </table>
+      </table></div>
     </div>
   `;
   document.getElementById('backToDashBtn').onclick = () => { CURRENT_TAB = 'dashboard'; renderNav(); renderContent(); };
